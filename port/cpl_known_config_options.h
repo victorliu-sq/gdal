@@ -385,6 +385,7 @@ constexpr static const char* const apszKnownConfigOptions[] =
    "GDAL_PDF_WRITE_GEOREF_ON_IMAGE", // from pdfcreatecopy.cpp
    "GDAL_PNG_SINGLE_BLOCK", // from pngdataset.cpp
    "GDAL_PNG_WHOLE_IMAGE_OPTIM", // from pngdataset.cpp
+   "GDAL_POLYGONIZE_XRASP", // from polygonize_xrasp.cpp
    "GDAL_PROXY_AUTH", // from cpl_http.cpp
    "GDAL_PYTHON_DRIVER_PATH", // from gdalpythondriverloader.cpp
    "GDAL_RASTER_INDEX_BATCH_SIZE", // from gdaltindex_lib.cpp

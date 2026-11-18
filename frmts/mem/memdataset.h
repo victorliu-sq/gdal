@@ -231,6 +231,18 @@ class CPL_DLL MEMRasterBand CPL_NON_FINAL : public GDALPamRasterBand
     {
         return (pabyData);
     }
+
+    // The layout of that buffer: bytes from a pixel to the next one of its
+    // line, and from a line to the next one.
+    GSpacing GetPixelOffset() const
+    {
+        return nPixelOffset;
+    }
+
+    GSpacing GetLineOffset() const
+    {
+        return nLineOffset;
+    }
 };
 
 /************************************************************************/

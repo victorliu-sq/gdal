@@ -36,6 +36,7 @@
 #include "cpl_vsi.h"
 
 #include "polygonize_polygonizer.h"
+#include "polygonize_xrasp.h"
 
 using namespace gdal::polygonizer;
 
@@ -523,6 +524,15 @@ CPLErr CPL_STDCALL GDALPolygonize(GDALRasterBandH hSrcBand,
                                   void *pProgressArg)
 
 {
+    // X-Rasp, a parallel polygonizer, when it takes the request
+    // (alg/xrasp/README.md); the polygonizer below otherwise.
+    {
+        CPLErr eErr = CE_None;
+        if (GDALPolygonizeXRasp(hSrcBand, hMaskBand, hOutLayer, iPixValField,
+                                papszOptions, pfnProgress, pProgressArg,
+                                &eErr))
+            return eErr;
+    }
     return GDALPolygonizeT<std::int64_t, IntEqualityTest>(
         hSrcBand, hMaskBand, hOutLayer, iPixValField, papszOptions, pfnProgress,
         pProgressArg, GDT_Int64);
