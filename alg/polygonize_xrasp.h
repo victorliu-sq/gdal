@@ -31,6 +31,16 @@ bool GDALPolygonizeXRasp(GDALRasterBandH hSrcBand, GDALRasterBandH hMaskBand,
                          GDALProgressFunc pfnProgress, void *pProgressArg,
                          CPLErr *peErr);
 
+/** The same for GDALFPolygonize(), whose cells are floats: a band that is not
+ * of type Float64, without neighbouring cells that are almost equal and not
+ * the same (those the default polygonizer joins in a way X-Rasp does not).
+ */
+bool GDALFPolygonizeXRasp(GDALRasterBandH hSrcBand, GDALRasterBandH hMaskBand,
+                          OGRLayerH hOutLayer, int iPixValField,
+                          CSLConstList papszOptions,
+                          GDALProgressFunc pfnProgress, void *pProgressArg,
+                          CPLErr *peErr);
+
 /*! @endcond */
 
 #endif /* POLYGONIZE_XRASP_H_INCLUDED */

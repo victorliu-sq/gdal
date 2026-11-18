@@ -617,6 +617,15 @@ CPLErr CPL_STDCALL GDALFPolygonize(GDALRasterBandH hSrcBand,
                                    void *pProgressArg)
 
 {
+    // X-Rasp, a parallel polygonizer, when it takes the request
+    // (alg/xrasp/README.md); the polygonizer below otherwise.
+    {
+        CPLErr eErr = CE_None;
+        if (GDALFPolygonizeXRasp(hSrcBand, hMaskBand, hOutLayer, iPixValField,
+                                 papszOptions, pfnProgress, pProgressArg,
+                                 &eErr))
+            return eErr;
+    }
     if (GDALGetRasterDataType(hSrcBand) == GDT_Float64)
     {
         return GDALPolygonizeT<double, DoubleEqualityTest>(

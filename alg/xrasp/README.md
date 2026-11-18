@@ -17,7 +17,9 @@ X-Rasp finds from the vertices; a ring starts at its top-left vertex.
 It takes a request when
 
 * there is no mask band and 4 connectedness is asked for (no `8CONNECTED`),
-* the band is of an integer type of at most 32 bits,
+* the band is of an integer type of at most 32 bits (`GDALPolygonize()`), or
+  not of type Float64 and without neighbouring cells that are almost equal
+  but not the same float (`GDALFPolygonize()`, see below),
 * the whole band fits in memory (the default polygonizer reads line by line).
 
 X-Rasp is standard C++, part of every build of GDAL, and needs nothing GDAL
@@ -26,8 +28,17 @@ does not have. Its threads are OpenMP's when GDAL itself uses OpenMP
 threads (`GDALGetGlobalThreadPool()`) otherwise. The features are the same with either.
 
 Otherwise, and when X-Rasp gives up (more than 2^31 - 1 vertices), the default
-polygonizer runs; nothing has been written by then. `GDALFPolygonize()` is not
-touched.
+polygonizer runs; nothing has been written by then.
+
+`GDALFPolygonize()` takes two neighbouring cells for equal when at most 10
+floats lie between them. That is not transitive, and the default polygonizer
+draws no edge between two cells of one polygon whatever their values, while
+X-Rasp draws an edge wherever two neighbours differ. The two agree when every
+pair of neighbours is either the same float or further apart than that, which
+X-Rasp checks first, with all the threads; it then runs on the bits of the
+floats. Rasters of classes kept as floats pass; a raster where two
+neighbours are almost equal and not the same is left to the default
+polygonizer.
 
 Configuration options:
 

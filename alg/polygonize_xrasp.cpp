@@ -25,6 +25,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <fstream>
 #include <memory>
@@ -135,7 +136,7 @@ double Seconds(std::chrono::steady_clock::time_point oSince)
 std::unique_ptr<OGRFeature> EmptyFeatureOf(const xrasp::Polygons &oPolygons,
                                            int64_t iPoly,
                                            OGRFeatureDefn *poDefn,
-                                           int iPixValField)
+                                           int iPixValField, double dfValue)
 {
     // In the CPU build "device" memory is host memory.
     const int64_t *panPolyOffset = oPolygons.poly_offsets.data();
@@ -159,8 +160,7 @@ std::unique_ptr<OGRFeature> EmptyFeatureOf(const xrasp::Polygons &oPolygons,
     poFeature->SetGeometryDirectly(poPolygon.release());
     poFeature->SetFID(OGRNullFID);
     if (iPixValField >= 0)
-        poFeature->SetField(iPixValField,
-                            static_cast<double>(oPolygons.values.data()[iPoly]));
+        poFeature->SetField(iPixValField, dfValue);
     return poFeature;
 }
 
@@ -205,9 +205,11 @@ void FillFeature(const xrasp::Polygons &oPolygons, int64_t iPoly,
  * bSkipMarker: leave out the polygons of value GP_NODATA_MARKER.  The default
  * polygonizer marks masked pixels with that value, and so takes a pixel that
  * holds it for a masked one.
+ *
+ * bFloat: the values of the polygons are the bits of floats (FloatCells).
  */
 bool MakeFeatures(const xrasp::Polygons &oPolygons, OGRFeatureDefn *poDefn,
-                  int iPixValField, bool bSkipMarker,
+                  int iPixValField, bool bSkipMarker, bool bFloat,
                   std::vector<std::unique_ptr<OGRFeature>> &apoFeatures)
 {
     const int64_t *panValue = oPolygons.values.data();
@@ -217,10 +219,18 @@ bool MakeFeatures(const xrasp::Polygons &oPolygons, OGRFeatureDefn *poDefn,
         apoFeatures.resize(static_cast<size_t>(nPolygons));
         for (int64_t iPoly = 0; iPoly < nPolygons; ++iPoly)
         {
-            if (bSkipMarker && panValue[iPoly] == GP_NODATA_MARKER)
+            double dfValue = static_cast<double>(panValue[iPoly]);
+            if (bFloat)
+            {
+                const uint32_t nBits = static_cast<uint32_t>(panValue[iPoly]);
+                float fValue = 0;
+                memcpy(&fValue, &nBits, sizeof(fValue));
+                dfValue = static_cast<double>(fValue);
+            }
+            if (bSkipMarker && dfValue == GP_NODATA_MARKER)
                 continue;
-            apoFeatures[iPoly] =
-                EmptyFeatureOf(oPolygons, iPoly, poDefn, iPixValField);
+            apoFeatures[iPoly] = EmptyFeatureOf(oPolygons, iPoly, poDefn,
+                                                iPixValField, dfValue);
             if (!apoFeatures[iPoly])
                 return false;
         }
@@ -324,6 +334,70 @@ CPLErr WriteFeatures(xrasp::Polygons &oPolygons, const int32_t *panOrder,
     return eErr;
 }
 
+/** Whether floats, given as their bits, are cells X-Rasp polygonizes as the
+ * default polygonizer does.
+ *
+ * GDALFPolygonize() takes two neighbouring cells for equal when at most
+ * MAX_ULPS floats lie between them (GDALFloatAlmostEquals).  That is not
+ * transitive: cells a, b, c in a row may make one polygon while a and c, were
+ * they neighbours, would not be equal -- and the default polygonizer draws no
+ * edge between two cells of one polygon, whatever their values.  X-Rasp draws
+ * an edge where two neighbours differ.  The two agree when every pair of
+ * neighbours is either the same float or further apart than MAX_ULPS: almost
+ * equal is then the same as equal bits, and X-Rasp runs on the bits.  That is
+ * what is checked here, with all the threads; +0 next to -0 (equal, other
+ * bits) does not pass either.  A raster that does not pass is left to the
+ * default polygonizer.
+ */
+bool FloatCellsAreExact(const uint32_t *panBits, int nXSize, int nYSize,
+                        int nThreads)
+{
+    // the place of a float among the floats, as GDALFloatAlmostEquals has it
+    const auto Place = [](uint32_t nBits)
+    {
+        constexpr uint32_t SHIFT = static_cast<uint32_t>(1) << 31;
+        return (nBits >> 31) != 0 ? SHIFT - (nBits & ~SHIFT) : nBits + SHIFT;
+    };
+    const auto Apart = [&Place](uint32_t nA, uint32_t nB)
+    {
+        if (nA == nB)
+            return true;
+        const uint32_t nPlaceA = Place(nA);
+        const uint32_t nPlaceB = Place(nB);
+        return (nPlaceA > nPlaceB ? nPlaceA - nPlaceB : nPlaceB - nPlaceA) >
+               static_cast<uint32_t>(MAX_ULPS);
+    };
+    std::atomic<bool> bExact{true};
+    const int nParts = std::max(1, std::min(nThreads, nYSize));
+    xrasp::RunParts(
+        nParts,
+        [&](int iPart)
+        {
+            const int nLastY = static_cast<int>(
+                static_cast<int64_t>(nYSize) * (iPart + 1) / nParts);
+            for (int iY = static_cast<int>(static_cast<int64_t>(nYSize) *
+                                           iPart / nParts);
+                 iY < nLastY && bExact.load(std::memory_order_relaxed); ++iY)
+            {
+                const uint32_t *panRow =
+                    panBits + static_cast<size_t>(iY) * nXSize;
+                const uint32_t *panBelow =
+                    iY + 1 < nYSize ? panRow + nXSize : nullptr;
+                bool bRow = true;
+                for (int iX = 0; iX < nXSize; ++iX)
+                {
+                    if (iX + 1 < nXSize)
+                        bRow &= Apart(panRow[iX], panRow[iX + 1]);
+                    if (panBelow)
+                        bRow &= Apart(panRow[iX], panBelow[iX]);
+                }
+                if (!bRow)
+                    bExact.store(false, std::memory_order_relaxed);
+            }
+        });
+    return bExact.load();
+}
+
 /** The cells of the band where they already are, row after row, or null:
  * a band of a MEM dataset whose buffer has the layout X-Rasp reads. */
 template <typename T>
@@ -347,9 +421,11 @@ const T *CellsInPlace(GDALRasterBand *poBand, GDALDataType eDT)
     return reinterpret_cast<const T *>(pabyData);
 }
 
+/** eDT: the type the cells are read as.  bFloat: they are floats
+ * (GDT_Float32), which X-Rasp takes as their bits (T is uint32_t). */
 template <typename T>
-bool Run(GDALRasterBandH hSrcBand, GDALDataType eDT, OGRLayerH hOutLayer,
-         int iPixValField, CSLConstList papszOptions,
+bool Run(GDALRasterBandH hSrcBand, GDALDataType eDT, bool bFloat,
+         OGRLayerH hOutLayer, int iPixValField, CSLConstList papszOptions,
          GDALProgressFunc pfnProgress, void *pProgressArg, CPLErr *peErr)
 {
     const int nXSize = GDALGetRasterBandXSize(hSrcBand);
@@ -428,6 +504,17 @@ bool Run(GDALRasterBandH hSrcBand, GDALDataType eDT, OGRLayerH hOutLayer,
     xrasp::SetCpuPool(RunOnGDALPool);
     const int nThreadsBefore = xrasp::CpuThreads();
     xrasp::SetCpuThreads(nThreads);
+    if (bFloat &&
+        !FloatCellsAreExact(reinterpret_cast<const uint32_t *>(paCells),
+                            nXSize, nYSize, nThreads))
+    {
+        xrasp::SetCpuThreads(nThreadsBefore);
+        VSIFree(paCellsRead);
+        CPLDebug("GDAL", "X-Rasp: neighbouring cells that are almost equal "
+                         "and not the same, the default polygonizer takes "
+                         "over");
+        return false;
+    }
     bool bDone = false;
     try
     {
@@ -501,7 +588,8 @@ bool Run(GDALRasterBandH hSrcBand, GDALDataType eDT, OGRLayerH hOutLayer,
     std::vector<std::unique_ptr<OGRFeature>> apoFeatures;
     const bool bMade = MakeFeatures(
         oPolygons, OGRLayer::FromHandle(hOutLayer)->GetLayerDefn(),
-        iPixValField, /* bSkipMarker = */ eDT == GDT_Int32, apoFeatures);
+        iPixValField, /* bSkipMarker = */ eDT == GDT_Int32 || bFloat, bFloat,
+        apoFeatures);
     const double dfMakeSeconds = Seconds(oStart);
     if (oOrderThread.joinable())
     {
@@ -575,11 +663,9 @@ bool Run(GDALRasterBandH hSrcBand, GDALDataType eDT, OGRLayerH hOutLayer,
 
 }  // namespace
 
-bool GDALPolygonizeXRasp(GDALRasterBandH hSrcBand, GDALRasterBandH hMaskBand,
-                         OGRLayerH hOutLayer, int iPixValField,
-                         CSLConstList papszOptions,
-                         GDALProgressFunc pfnProgress, void *pProgressArg,
-                         CPLErr *peErr)
+/** What X-Rasp asks of a request, whatever the cells. */
+static bool TakesRequest(GDALRasterBandH hSrcBand, GDALRasterBandH hMaskBand,
+                         OGRLayerH hOutLayer, CSLConstList papszOptions)
 {
     if (hSrcBand == nullptr || hOutLayer == nullptr || hMaskBand != nullptr)
         return false;
@@ -589,8 +675,36 @@ bool GDALPolygonizeXRasp(GDALRasterBandH hSrcBand, GDALRasterBandH hMaskBand,
         return false;
     if (!OGR_L_TestCapability(hOutLayer, OLCSequentialWrite))
         return false;
-    if (GDALGetRasterBandXSize(hSrcBand) < 1 ||
-        GDALGetRasterBandYSize(hSrcBand) < 1)
+    return GDALGetRasterBandXSize(hSrcBand) >= 1 &&
+           GDALGetRasterBandYSize(hSrcBand) >= 1;
+}
+
+bool GDALFPolygonizeXRasp(GDALRasterBandH hSrcBand, GDALRasterBandH hMaskBand,
+                          OGRLayerH hOutLayer, int iPixValField,
+                          CSLConstList papszOptions,
+                          GDALProgressFunc pfnProgress, void *pProgressArg,
+                          CPLErr *peErr)
+{
+    if (!TakesRequest(hSrcBand, hMaskBand, hOutLayer, papszOptions))
+        return false;
+    // GDALFPolygonize() reads a Float64 band as doubles, which X-Rasp does
+    // not take, and a band of any other type as floats.
+    if (GDALGetRasterDataType(hSrcBand) == GDT_Float64)
+        return false;
+    if (pfnProgress == nullptr)
+        pfnProgress = GDALDummyProgress;
+    return Run<uint32_t>(hSrcBand, GDT_Float32, /* bFloat = */ true,
+                         hOutLayer, iPixValField, papszOptions, pfnProgress,
+                         pProgressArg, peErr);
+}
+
+bool GDALPolygonizeXRasp(GDALRasterBandH hSrcBand, GDALRasterBandH hMaskBand,
+                         OGRLayerH hOutLayer, int iPixValField,
+                         CSLConstList papszOptions,
+                         GDALProgressFunc pfnProgress, void *pProgressArg,
+                         CPLErr *peErr)
+{
+    if (!TakesRequest(hSrcBand, hMaskBand, hOutLayer, papszOptions))
         return false;
     if (pfnProgress == nullptr)
         pfnProgress = GDALDummyProgress;
@@ -599,26 +713,26 @@ bool GDALPolygonizeXRasp(GDALRasterBandH hSrcBand, GDALRasterBandH hMaskBand,
     switch (eDT)
     {
         case GDT_Byte:
-            return Run<uint8_t>(hSrcBand, eDT, hOutLayer, iPixValField,
+            return Run<uint8_t>(hSrcBand, eDT, false, hOutLayer, iPixValField,
                                 papszOptions, pfnProgress, pProgressArg,
                                 peErr);
         case GDT_Int8:
-            return Run<int8_t>(hSrcBand, eDT, hOutLayer, iPixValField,
+            return Run<int8_t>(hSrcBand, eDT, false, hOutLayer, iPixValField,
                                papszOptions, pfnProgress, pProgressArg, peErr);
         case GDT_UInt16:
-            return Run<uint16_t>(hSrcBand, eDT, hOutLayer, iPixValField,
+            return Run<uint16_t>(hSrcBand, eDT, false, hOutLayer, iPixValField,
                                  papszOptions, pfnProgress, pProgressArg,
                                  peErr);
         case GDT_Int16:
-            return Run<int16_t>(hSrcBand, eDT, hOutLayer, iPixValField,
+            return Run<int16_t>(hSrcBand, eDT, false, hOutLayer, iPixValField,
                                 papszOptions, pfnProgress, pProgressArg,
                                 peErr);
         case GDT_UInt32:
-            return Run<uint32_t>(hSrcBand, eDT, hOutLayer, iPixValField,
+            return Run<uint32_t>(hSrcBand, eDT, false, hOutLayer, iPixValField,
                                  papszOptions, pfnProgress, pProgressArg,
                                  peErr);
         case GDT_Int32:
-            return Run<int32_t>(hSrcBand, eDT, hOutLayer, iPixValField,
+            return Run<int32_t>(hSrcBand, eDT, false, hOutLayer, iPixValField,
                                 papszOptions, pfnProgress, pProgressArg,
                                 peErr);
         default:
