@@ -32,6 +32,7 @@
 #include <set>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <typeinfo>
 #include <utility>
 #include <vector>
@@ -206,10 +207,11 @@ void FillFeature(const xrasp::Polygons &oPolygons, int64_t iPoly,
  * polygonizer marks masked pixels with that value, and so takes a pixel that
  * holds it for a masked one.
  *
- * bFloat: the values of the polygons are the bits of floats (FloatCells).
+ * nFloatBytes: 4 or 8 when the values of the polygons are the bits of floats
+ * or of doubles, 0 when they are integers.
  */
 bool MakeFeatures(const xrasp::Polygons &oPolygons, OGRFeatureDefn *poDefn,
-                  int iPixValField, bool bSkipMarker, bool bFloat,
+                  int iPixValField, bool bSkipMarker, int nFloatBytes,
                   std::vector<std::unique_ptr<OGRFeature>> &apoFeatures)
 {
     const int64_t *panValue = oPolygons.values.data();
@@ -220,12 +222,16 @@ bool MakeFeatures(const xrasp::Polygons &oPolygons, OGRFeatureDefn *poDefn,
         for (int64_t iPoly = 0; iPoly < nPolygons; ++iPoly)
         {
             double dfValue = static_cast<double>(panValue[iPoly]);
-            if (bFloat)
+            if (nFloatBytes == 4)
             {
                 const uint32_t nBits = static_cast<uint32_t>(panValue[iPoly]);
                 float fValue = 0;
                 memcpy(&fValue, &nBits, sizeof(fValue));
                 dfValue = static_cast<double>(fValue);
+            }
+            else if (nFloatBytes == 8)
+            {
+                memcpy(&dfValue, &panValue[iPoly], sizeof(dfValue));
             }
             if (bSkipMarker && dfValue == GP_NODATA_MARKER)
                 continue;
@@ -334,40 +340,51 @@ CPLErr WriteFeatures(xrasp::Polygons &oPolygons, const int32_t *panOrder,
     return eErr;
 }
 
-/** Whether floats, given as their bits, are cells X-Rasp polygonizes as the
- * default polygonizer does.
+/** Whether X-Rasp polygonizes these cells as the default polygonizer does:
+ * a check of cells of 64 bits and of floats, with all the threads.
  *
- * GDALFPolygonize() takes two neighbouring cells for equal when at most
- * MAX_ULPS floats lie between them (GDALFloatAlmostEquals).  That is not
- * transitive: cells a, b, c in a row may make one polygon while a and c, were
- * they neighbours, would not be equal -- and the default polygonizer draws no
- * edge between two cells of one polygon, whatever their values.  X-Rasp draws
- * an edge where two neighbours differ.  The two agree when every pair of
- * neighbours is either the same float or further apart than MAX_ULPS: almost
- * equal is then the same as equal bits, and X-Rasp runs on the bits.  That is
- * what is checked here, with all the threads; +0 next to -0 (equal, other
- * bits) does not pass either.  A raster that does not pass is left to the
- * default polygonizer.
+ * Cells of 64 bits: X-Rasp keeps one value of 64 bits for what is outside
+ * the raster (xrasp::kOutside), which no cell may hold.
+ *
+ * Floats (bFloat; T holds their bits): GDALFPolygonize() takes two
+ * neighbouring cells for equal when at most MAX_ULPS floats lie between them
+ * (GDALFloatAlmostEquals).  That is not transitive: cells a, b, c in a row
+ * may make one polygon while a and c, were they neighbours, would not be
+ * equal -- and the default polygonizer draws no edge between two cells of one
+ * polygon, whatever their values.  X-Rasp draws an edge where two neighbours
+ * differ.  The two agree when every pair of neighbours is either the same
+ * float or further apart than MAX_ULPS: almost equal is then the same as
+ * equal bits, and X-Rasp runs on the bits.  +0 next to -0 (equal, other bits)
+ * does not pass either.
+ *
+ * A raster that does not pass is left to the default polygonizer.
  */
-bool FloatCellsAreExact(const uint32_t *panBits, int nXSize, int nYSize,
-                        int nThreads)
+template <typename T>
+bool CellsAreTaken(const T *paCells, bool bFloat, int nXSize, int nYSize,
+                   int nThreads)
 {
+    typedef typename std::make_unsigned<T>::type Bits;
+    constexpr int NBITS = 8 * static_cast<int>(sizeof(T)) - 1;
     // the place of a float among the floats, as GDALFloatAlmostEquals has it
-    const auto Place = [](uint32_t nBits)
+    const auto Place = [](Bits nBits)
     {
-        constexpr uint32_t SHIFT = static_cast<uint32_t>(1) << 31;
-        return (nBits >> 31) != 0 ? SHIFT - (nBits & ~SHIFT) : nBits + SHIFT;
+        constexpr Bits SHIFT = static_cast<Bits>(1) << NBITS;
+        return static_cast<Bits>((nBits >> NBITS) != 0
+                                     ? SHIFT - (nBits & ~SHIFT)
+                                     : nBits + SHIFT);
     };
-    const auto Apart = [&Place](uint32_t nA, uint32_t nB)
+    const auto Apart = [&Place](T nA, T nB)
     {
         if (nA == nB)
             return true;
-        const uint32_t nPlaceA = Place(nA);
-        const uint32_t nPlaceB = Place(nB);
-        return (nPlaceA > nPlaceB ? nPlaceA - nPlaceB : nPlaceB - nPlaceA) >
-               static_cast<uint32_t>(MAX_ULPS);
+        const Bits nPlaceA = Place(static_cast<Bits>(nA));
+        const Bits nPlaceB = Place(static_cast<Bits>(nB));
+        return static_cast<Bits>(nPlaceA > nPlaceB ? nPlaceA - nPlaceB
+                                                   : nPlaceB - nPlaceA) >
+               static_cast<Bits>(MAX_ULPS);
     };
-    std::atomic<bool> bExact{true};
+    const bool bWide = sizeof(T) == sizeof(int64_t);
+    std::atomic<bool> bTaken{true};
     const int nParts = std::max(1, std::min(nThreads, nYSize));
     xrasp::RunParts(
         nParts,
@@ -377,25 +394,33 @@ bool FloatCellsAreExact(const uint32_t *panBits, int nXSize, int nYSize,
                 static_cast<int64_t>(nYSize) * (iPart + 1) / nParts);
             for (int iY = static_cast<int>(static_cast<int64_t>(nYSize) *
                                            iPart / nParts);
-                 iY < nLastY && bExact.load(std::memory_order_relaxed); ++iY)
+                 iY < nLastY && bTaken.load(std::memory_order_relaxed); ++iY)
             {
-                const uint32_t *panRow =
-                    panBits + static_cast<size_t>(iY) * nXSize;
-                const uint32_t *panBelow =
-                    iY + 1 < nYSize ? panRow + nXSize : nullptr;
+                const T *paRow = paCells + static_cast<size_t>(iY) * nXSize;
+                const T *paBelow =
+                    iY + 1 < nYSize ? paRow + nXSize : nullptr;
                 bool bRow = true;
-                for (int iX = 0; iX < nXSize; ++iX)
+                if (bWide)
                 {
-                    if (iX + 1 < nXSize)
-                        bRow &= Apart(panRow[iX], panRow[iX + 1]);
-                    if (panBelow)
-                        bRow &= Apart(panRow[iX], panBelow[iX]);
+                    for (int iX = 0; iX < nXSize; ++iX)
+                        bRow &= static_cast<int64_t>(paRow[iX]) !=
+                                xrasp::kOutside;
+                }
+                if (bFloat)
+                {
+                    for (int iX = 0; iX < nXSize; ++iX)
+                    {
+                        if (iX + 1 < nXSize)
+                            bRow &= Apart(paRow[iX], paRow[iX + 1]);
+                        if (paBelow)
+                            bRow &= Apart(paRow[iX], paBelow[iX]);
+                    }
                 }
                 if (!bRow)
-                    bExact.store(false, std::memory_order_relaxed);
+                    bTaken.store(false, std::memory_order_relaxed);
             }
         });
-    return bExact.load();
+    return bTaken.load();
 }
 
 /** The cells of the band where they already are, row after row, or null:
@@ -421,8 +446,9 @@ const T *CellsInPlace(GDALRasterBand *poBand, GDALDataType eDT)
     return reinterpret_cast<const T *>(pabyData);
 }
 
-/** eDT: the type the cells are read as.  bFloat: they are floats
- * (GDT_Float32), which X-Rasp takes as their bits (T is uint32_t). */
+/** eDT: the type the cells are read as.  bFloat: they are floats or doubles
+ * (GDT_Float32, GDT_Float64), which X-Rasp takes as their bits (T is uint32_t
+ * or uint64_t). */
 template <typename T>
 bool Run(GDALRasterBandH hSrcBand, GDALDataType eDT, bool bFloat,
          OGRLayerH hOutLayer, int iPixValField, CSLConstList papszOptions,
@@ -504,15 +530,15 @@ bool Run(GDALRasterBandH hSrcBand, GDALDataType eDT, bool bFloat,
     xrasp::SetCpuPool(RunOnGDALPool);
     const int nThreadsBefore = xrasp::CpuThreads();
     xrasp::SetCpuThreads(nThreads);
-    if (bFloat &&
-        !FloatCellsAreExact(reinterpret_cast<const uint32_t *>(paCells),
-                            nXSize, nYSize, nThreads))
+    if ((bFloat || sizeof(T) == sizeof(int64_t)) &&
+        !CellsAreTaken(paCells, bFloat, nXSize, nYSize, nThreads))
     {
         xrasp::SetCpuThreads(nThreadsBefore);
         VSIFree(paCellsRead);
-        CPLDebug("GDAL", "X-Rasp: neighbouring cells that are almost equal "
-                         "and not the same, the default polygonizer takes "
-                         "over");
+        CPLDebug("GDAL", "X-Rasp: %s, the default polygonizer takes over",
+                 bFloat ? "neighbouring cells that are almost equal and not "
+                          "the same, or a cell of -0 as a double"
+                        : "a cell of the smallest value of 64 bits");
         return false;
     }
     bool bDone = false;
@@ -588,8 +614,9 @@ bool Run(GDALRasterBandH hSrcBand, GDALDataType eDT, bool bFloat,
     std::vector<std::unique_ptr<OGRFeature>> apoFeatures;
     const bool bMade = MakeFeatures(
         oPolygons, OGRLayer::FromHandle(hOutLayer)->GetLayerDefn(),
-        iPixValField, /* bSkipMarker = */ eDT == GDT_Int32 || bFloat, bFloat,
-        apoFeatures);
+        iPixValField,
+        /* bSkipMarker = */ eDT == GDT_Int32 || eDT == GDT_Int64 || bFloat,
+        bFloat ? static_cast<int>(sizeof(T)) : 0, apoFeatures);
     const double dfMakeSeconds = Seconds(oStart);
     if (oOrderThread.joinable())
     {
@@ -687,12 +714,14 @@ bool GDALFPolygonizeXRasp(GDALRasterBandH hSrcBand, GDALRasterBandH hMaskBand,
 {
     if (!TakesRequest(hSrcBand, hMaskBand, hOutLayer, papszOptions))
         return false;
-    // GDALFPolygonize() reads a Float64 band as doubles, which X-Rasp does
-    // not take, and a band of any other type as floats.
-    if (GDALGetRasterDataType(hSrcBand) == GDT_Float64)
-        return false;
     if (pfnProgress == nullptr)
         pfnProgress = GDALDummyProgress;
+    // GDALFPolygonize() reads a Float64 band as doubles and a band of any
+    // other type as floats.
+    if (GDALGetRasterDataType(hSrcBand) == GDT_Float64)
+        return Run<uint64_t>(hSrcBand, GDT_Float64, /* bFloat = */ true,
+                             hOutLayer, iPixValField, papszOptions,
+                             pfnProgress, pProgressArg, peErr);
     return Run<uint32_t>(hSrcBand, GDT_Float32, /* bFloat = */ true,
                          hOutLayer, iPixValField, papszOptions, pfnProgress,
                          pProgressArg, peErr);
@@ -736,7 +765,10 @@ bool GDALPolygonizeXRasp(GDALRasterBandH hSrcBand, GDALRasterBandH hMaskBand,
                                 papszOptions, pfnProgress, pProgressArg,
                                 peErr);
         default:
-            // 64-bit and floating-point cells: the default polygonizer
-            return false;
+            // Any other band is read as integers of 64 bits, as
+            // GDALPolygonize() reads every band.
+            return Run<int64_t>(hSrcBand, GDT_Int64, false, hOutLayer,
+                                iPixValField, papszOptions, pfnProgress,
+                                pProgressArg, peErr);
     }
 }

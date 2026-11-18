@@ -341,11 +341,46 @@ def test_polygonize_xrasp_not_taken():
     assert not taken
     assert got == polygonize(band, False, mask=mask)[0]
 
+    # a band of any other type is read as integers of 64 bits, as
+    # Polygonize() reads it
     for dtype in ("i8", "u8", "f4", "f8"):
         other = raster_of(cells.astype(dtype))
         got, taken = polygonize(other.GetRasterBand(1), True)
-        assert not taken
+        assert taken
         assert got == expected
+
+
+def test_polygonize_xrasp_64_bits():
+    rng = np.random.default_rng(21)
+    low = -(1 << 63)
+    # values that differ above bit 32 only, the ends of the type
+    pool = [0, 1 << 40, (1 << 40) + 1, (1 << 63) - 1, low + 1, -1, 1 << 32]
+    for values in (2, 4, 7):
+        for _ in range(40):
+            h, w = (int(v) for v in rng.integers(1, 21, size=2))
+            check_same(random_cells(rng, h, w, "i8", pool[:values], 0.4))
+    for threads in (1, 3, None):
+        check_same(random_cells(rng, 331, 517, "i8", pool[:3], 0.45), threads=threads)
+    # unsigned: read as signed, the values above its end become its end
+    upool = [0, 1 << 40, (1 << 63) - 1, 1 << 63, (1 << 64) - 1]
+    for _ in range(40):
+        check_same(random_cells(rng, 15, 19, "u8", upool, 0.3))
+    # the value the default polygonizer keeps for masked pixels
+    for _ in range(10):
+        got = check_same(random_cells(rng, 17, 21, "i8", [3, GP_NODATA_MARKER, 5], 0.5))
+        assert all(v != GP_NODATA_MARKER for v, _ in got)
+    # the smallest value is the one X-Rasp keeps for itself: not taken
+    cells = random_cells(rng, 15, 19, "i8", [low, 0, 7], 0.3)
+    check_same(cells, expect_taken=False)
+    cells = random_cells(rng, 300, 400, "i8", [1, 0, 7], 0.3)
+    cells[299, 399] = low
+    check_same(cells, expect_taken=False, threads=4)
+    # floats through Polygonize(): cut to integers; not a number and the
+    # infinities as the band is read
+    cells = random_cells(rng, 15, 19, "f4", [0.5, 1.5, -2.7, 3.0], 0.3)
+    check_same(cells)
+    cells = random_cells(rng, 15, 19, "f8", [np.nan, np.inf, -np.inf, 3.0], 0.3)
+    check_same(cells, expect_taken=None)
 
 
 ###############################################################################
@@ -558,8 +593,8 @@ def test_fpolygonize_xrasp_marker_value():
 
 
 def test_fpolygonize_xrasp_other_bands():
-    """A band that is not of floats is read as floats, as FPolygonize() does;
-    a band of doubles is left to the default polygonizer."""
+    """A band that is not of floats or doubles is read as floats, as
+    FPolygonize() does."""
     rng = np.random.default_rng(15)
     for dtype, pool in (
         ("u1", [0, 255, 7]),
@@ -570,8 +605,53 @@ def test_fpolygonize_xrasp_other_bands():
     ):
         for _ in range(10):
             check_same(random_cells(rng, 13, 17, dtype, pool, 0.4), floats=True)
-    cells = random_cells(rng, 13, 17, "f8", [0.5, 1.5, 2.5], 0.4)
-    check_same(cells, floats=True, expect_taken=False)
+
+
+def test_fpolygonize_xrasp_doubles():
+    """A band of doubles: FPolygonize() compares doubles."""
+    rng = np.random.default_rng(19)
+    info = np.finfo(np.float64)
+    # values that floats cannot tell apart, the ends of the type
+    pool = [0.5, 0.5 + 2.0**-40, 1e300, -1e300, info.max, info.tiny, 1.0 / 3.0]
+    for values in (2, 4, 7):
+        for _ in range(40):
+            h, w = (int(v) for v in rng.integers(1, 21, size=2))
+            got = check_same(random_cells(rng, h, w, "f8", pool[:values], 0.4), floats=True)
+            assert set(values_of(got)) <= set(pool)
+    for threads in (1, 3, None):
+        cells = random_cells(rng, 331, 517, "f8", pool[:3], 0.45)
+        check_same(cells, floats=True, threads=threads)
+    for pool in ([np.inf, -np.inf, 1.0, 0.0], [np.nan, 1.0, -2.0]):
+        for _ in range(20):
+            check_same(random_cells(rng, 15, 19, "f8", pool, 0.4), floats=True)
+    for _ in range(10):
+        cells = random_cells(rng, 17, 21, "f8", [3.0, GP_NODATA_MARKER, 5.5], 0.5)
+        got = check_same(cells, floats=True)
+        assert all(v != GP_NODATA_MARKER for v in values_of(got))
+    # almost equal and not the same: 10 doubles apart is equal, 11 is not
+    one = np.float64(1.0)
+    far = one
+    for _ in range(11):
+        far = np.nextafter(far, 2.0)
+    pair = np.array([[one, np.nextafter(far, 0.0)]], dtype=np.float64)
+    assert len(check_same(pair, floats=True, expect_taken=False)) == 1
+    assert len(check_same(pair.T.copy(), floats=True, expect_taken=False)) == 1
+    pair = np.array([[one, far]], dtype=np.float64)
+    assert len(check_same(pair, floats=True)) == 2
+    for _ in range(40):
+        h, w = (int(v) for v in rng.integers(1, 15, size=2))
+        cells = random_cells(rng, h, w, "f8", [one, np.nextafter(one, 2.0), far, 3.0], 0.4)
+        check_same(cells, floats=True, expect_taken=None)
+    # -0 as a double is the value X-Rasp keeps for itself: not taken
+    cells = random_cells(rng, 15, 19, "f8", [-0.0, 1.5], 0.5)
+    got = check_same(cells, floats=True, expect_taken=False)
+    assert struct.pack("<d", -0.0) in [v for v, _ in got]
+    cells = random_cells(rng, 300, 400, "f8", [0.25, 0.5, 0.75], 0.4)
+    check_same(cells, floats=True, threads=4)
+    cells[299, 399] = -0.0
+    check_same(cells, floats=True, threads=4, expect_taken=False)
+    cells = rng.random((200, 150)) * 1000
+    check_same(cells, floats=True, expect_taken=None)
 
 
 def test_fpolygonize_xrasp_almost_equal():
