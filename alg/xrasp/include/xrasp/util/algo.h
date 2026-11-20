@@ -3,7 +3,7 @@
 // Binary searches that run inside a kernel, on a sorted array.
 #include <cstdint>
 
-#include "xrasp/util/macros.h"
+#include "xrasp/backend/macros.h"
 
 namespace xrasp {
 

@@ -20,7 +20,7 @@
 #include "xrasp/structs/polygons.h"
 #include "xrasp/structs/rings.h"
 #include "xrasp/util/dev_array.h"
-#include "xrasp/util/launcher.h"
+#include "xrasp/backend/launcher.h"
 
 namespace xrasp {
 
@@ -32,10 +32,11 @@ struct IsPolygonStart {
 // ring_value[r]: the raster value of ring r.  vx, vy: the corner of every vertex.  scan: null, or the order
 // of GDAL's polygonizer; without the numbers of the polygons in it (scan->seed empty) the polygons that end in
 // one row come in the order of their outer rings.  outer: null, or where to put the outer ring of every
-// polygon.
+// polygon.  slots: null, or where to put the place of every ring in the output -- the vertices are then
+// not written.
 inline void AssemblePolygons(const Rings& rings, const DArray<int64_t>& ring_value, const DArray<int32_t>& vx,
                              const DArray<int32_t>& vy, Polygons* out, const ScanOrder* scan = nullptr,
-                             DArray<int32_t>* outer = nullptr) {
+                             DArray<int32_t>* outer = nullptr, DArray<int32_t>* slots = nullptr) {
   const int64_t nr = rings.nr, nv = rings.nv;
   DArray<int64_t> key(nr);
   DArray<int32_t> order(nr);
@@ -119,6 +120,11 @@ inline void AssemblePolygons(const Rings& rings, const DArray<int64_t>& ring_val
     thrust::inclusive_scan(Exec(), out->ring_offsets.begin(), out->ring_offsets.end(), out->ring_offsets.begin());
   }
   order.Free();
+  if (slots != nullptr) {
+    // the caller writes the vertices itself (core/piece_pipeline.h): the place of every ring is all it needs
+    *slots = std::move(slot);
+    return;
+  }
 
   out->x.Reset(nv);
   out->y.Reset(nv);

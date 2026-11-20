@@ -1,22 +1,18 @@
-#ifndef XRASP_UTIL_LAUNCHER_H
-#define XRASP_UTIL_LAUNCHER_H
+#ifndef XRASP_BACKEND_LAUNCHER_H
+#define XRASP_BACKEND_LAUNCHER_H
 // Kernels are written as device lambdas:
 //
 //   ForEach(n, [=] __device__(size_t i) mutable { out[i] = f(in[i]); });
 //
-// runs the lambda for i = 0 .. n-1 (views are captured by value): on the GPU one GPU thread per index, on
-// the CPU the indices split evenly over the threads (util/cpu_threads.h), each thread a run of consecutive
+// runs the lambda for i = 0 .. n-1 (views are captured by value).
+// On the CPU the indices are split evenly over the threads (threads.h), each thread a run of consecutive
 // ones.
 #include <cstddef>
 
-#include "xrasp/util/macros.h"
-#ifdef XRASP_CPU
-#include "xrasp/util/cpu_threads.h"
-#endif
+#include "xrasp/backend/macros.h"
+#include "xrasp/backend/threads.h"
 
 namespace xrasp {
-
-#ifdef XRASP_CPU
 
 // With OpenMP the pool is OpenMP's: its threads are made once and stay (run with OMP_NUM_THREADS=n OMP_PLACES=cores
 // OMP_PROC_BIND=spread, a thread per core).  Two things learnt in GACGE (src/gap/gapbs/src/bfs.cc): the team
@@ -37,27 +33,5 @@ void ForEach(size_t size, F f) {
   });
 }
 
-#else
-
-template <typename F>
-__global__ void KernelForEach(size_t size, F f) {
-  size_t i = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-  if (i < size) {
-    f(i);
-  }
-}
-
-template <typename F>
-void ForEach(size_t size, F f) {
-  if (size == 0) return;
-  constexpr unsigned int kBlockSize = 256;
-  // a grid holds at most 2^31 - 1 blocks
-  size_t blocks = (size + kBlockSize - 1) / kBlockSize;
-  KernelForEach<<<static_cast<unsigned int>(blocks), kBlockSize>>>(size, f);
-  CUDA_CHECK(cudaGetLastError());
-}
-
-#endif
-
 }  // namespace xrasp
-#endif  // XRASP_UTIL_LAUNCHER_H
+#endif  // XRASP_BACKEND_LAUNCHER_H

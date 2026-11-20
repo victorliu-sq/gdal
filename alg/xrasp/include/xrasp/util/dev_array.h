@@ -11,7 +11,7 @@
 #include <thrust/fill.h>
 
 #include "xrasp/util/device_memory.h"
-#include "xrasp/util/macros.h"
+#include "xrasp/backend/macros.h"
 
 namespace xrasp {
 
@@ -130,20 +130,17 @@ template <typename T>
 class StripCells {
  public:
   void Load(const T* host, size_t size) {
-#ifdef XRASP_CPU
-    (void)size;
-    data_ = host;
-#else
-    array_.FromHost(host, size);
-    data_ = array_.data();
-#endif
+    if (kKernelsReadHostMemory) {
+      data_ = host;
+    } else {
+      array_.FromHost(host, size);
+      data_ = array_.data();
+    }
   }
   const T* data() const { return data_; }
 
  private:
-#ifndef XRASP_CPU
-  DArray<T> array_;
-#endif
+  DArray<T> array_;      // empty where the kernels read host memory
   const T* data_ = nullptr;
 };
 

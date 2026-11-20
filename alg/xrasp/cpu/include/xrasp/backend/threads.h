@@ -1,11 +1,11 @@
-#ifndef XRASP_UTIL_CPU_THREADS_H
-#define XRASP_UTIL_CPU_THREADS_H
-// The threads of the CPU build (XRASP_CPU).  Everything parallel there comes down to one call,
+#ifndef XRASP_BACKEND_THREADS_H
+#define XRASP_BACKEND_THREADS_H
+// The threads of the CPU backend.  Everything parallel there comes down to one call,
 //
 //   RunParts(parts, [&](int part) { ... });
 //
 // which runs the body for part = 0 .. parts-1, each on a thread of its own, and returns when all are done
-// (util/launcher.h and util/cpu_primitives.h cut their ranges into parts on top of it).  The threads are
+// (launcher.h and primitives.h cut their ranges into parts on top of it).  The threads are
 //
 //   OpenMP's          when the compiler was given OpenMP;
 //   the host's pool   otherwise, when the host has named one with SetCpuPool() -- inside GDAL the worker
@@ -125,4 +125,4 @@ void RunParts(int parts, Body body) {
 #endif
 
 }  // namespace xrasp
-#endif  // XRASP_UTIL_CPU_THREADS_H
+#endif  // XRASP_BACKEND_THREADS_H

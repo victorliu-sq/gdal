@@ -20,7 +20,7 @@
 #include "xrasp/structs/polygons.h"
 #include "xrasp/structs/vertex_lists.h"
 #include "xrasp/util/dev_array.h"
-#include "xrasp/util/launcher.h"
+#include "xrasp/backend/launcher.h"
 
 #include <thrust/sequence.h>
 #include <thrust/sort.h>
@@ -83,7 +83,7 @@ class WholeClock {
 template <typename T>
 class WholePolygonizer {
  public:
-  // cells: h rows of w cells in device memory (host memory in the CPU build); they must stay until
+  // cells: h rows of w cells in device memory (host memory on the CPU); they must stay until
   // FindOrder is done.  options.gdal_order is taken as set.
   void FindPolygons(const T* cells, int64_t h, int64_t w, const WholeOptions& options, Polygons* out,
                     WholeCounts* counts = nullptr, WholeProfile* profile = nullptr) {
@@ -145,36 +145,8 @@ class WholePolygonizer {
   // Steps 1 to 6 (PolygonizeWhole uses them too).
   void ToHoles(const T* cells, int64_t h, int64_t w, const WholeOptions& options, bool keep_links,
                WholeClock* clock) {
-    if (h < 1 || w < 1) throw std::runtime_error("the raster is empty");
-    const int64_t wc = w + 1, hc = h + 1;
+    ToLinks(cells, h, w, options, clock);
     WholeClock& done = *clock;
-    {
-      // s1: one strip with every corner row
-      DRasterView<T> view{cells, 0, h, h, w};
-      DArray<int64_t> pos[4];
-      DArray<uint8_t> flag[4];
-      FindVerticesInStripAs(options.corner_chunk, view, 0, hc, h, wc, hc, pos, flag, &edges_);
-      lists_.wc = wc;
-      lists_.hc = hc;
-      for (int d : {1, 3}) {
-        lists_.pos[d] = std::move(pos[d]);
-        lists_.flag[d] = std::move(flag[d]);
-      }
-      for (int d : {0, 2}) {
-        lists_.pos[d] = std::move(pos[d]);
-      }
-      done("vertices");
-      for (int d : {0, 2}) SortAndUnpackVertical(&lists_.pos[d], &lists_.flag[d]);
-      lists_.SetCounts();
-    }
-    done("sort");
-    if (lists_.size() > static_cast<int64_t>(INT32_MAX)) {
-      throw std::runtime_error("more than 2^31 - 1 vertices: this needs the band version");
-    }
-    if (options.link_index) BuildLineIndex(&lists_);          // s2
-    pipe_.Link(lists_);
-    FreeLineIndex(&lists_);
-    done("link");
     if (options.tile > 0) {                                   // s3
       pipe_.RankAndRelease(&lists_, options.tile, options.rank_walk);
     } else {
@@ -196,6 +168,39 @@ class WholePolygonizer {
       value[r] = static_cast<int64_t>(cells[static_cast<int64_t>(cy[r]) * w + cx[r]]);
     });
   }
+
+  // Steps 1 and 2.  (Virtual: core/polygonize_whole_bitmap.h has them on bitmaps.)
+  virtual void ToLinks(const T* cells, int64_t h, int64_t w, const WholeOptions& options, WholeClock* clock) {
+    if (h < 1 || w < 1) throw std::runtime_error("the raster is empty");
+    const int64_t wc = w + 1, hc = h + 1;
+    WholeClock& done = *clock;
+    // s1: one strip with every corner row
+    DRasterView<T> view{cells, 0, h, h, w};
+    DArray<int64_t> pos[4];
+    DArray<uint8_t> flag[4];
+    FindVerticesInStripAs(options.corner_chunk, view, 0, hc, h, wc, hc, pos, flag, &edges_);
+    lists_.wc = wc;
+    lists_.hc = hc;
+    for (int d : {1, 3}) {
+      lists_.pos[d] = std::move(pos[d]);
+      lists_.flag[d] = std::move(flag[d]);
+    }
+    for (int d : {0, 2}) {
+      lists_.pos[d] = std::move(pos[d]);
+    }
+    done("vertices");
+    for (int d : {0, 2}) SortAndUnpackVertical(&lists_.pos[d], &lists_.flag[d]);
+    lists_.SetCounts();
+    done("sort");
+    if (lists_.size() > static_cast<int64_t>(INT32_MAX)) {
+      throw std::runtime_error("more than 2^31 - 1 vertices: this needs the band version");
+    }
+    if (options.link_index) BuildLineIndex(&lists_);          // s2
+    pipe_.Link(lists_);
+    FreeLineIndex(&lists_);
+    done("link");
+  }
+  virtual ~WholePolygonizer() = default;
 
   // Step 7.  scan: null, or what is known of GDAL's order.
   void Assemble(Polygons* out, WholeCounts* counts, const ScanOrder* scan, DArray<int32_t>* outer) {
@@ -221,7 +226,26 @@ class WholePolygonizer {
   DArray<int32_t> outer_;       // the outer ring of every polygon of FindPolygons
 };
 
-// cells: h rows of w cells in device memory (host memory in the CPU build).  The polygons are GDAL's; with
+// Steps 1 to 7 with the polygonizer given (its steps 1 and 2 may be its own).
+template <typename T>
+void PolygonizeWholeWith(WholePolygonizer<T>* run, const T* cells, int64_t h, int64_t w,
+                         const WholeOptions& options, Polygons* out, WholeCounts* counts, WholeClock* clock) {
+  WholeClock& done = *clock;
+  run->ToHoles(cells, h, w, options, options.gdal_order, &done);
+  ScanOrder scan;
+  if (options.gdal_order) {
+    FindScanOrder(cells, w, run->lists_, run->edges_, run->pipe_.nxt, run->pipe_.vx, run->pipe_.vy,
+                  run->pipe_.rings, &scan);
+    done("order");
+  }
+  run->pipe_.nxt.Free();
+  run->edges_.Free();
+  run->lists_.Free();
+  run->Assemble(out, counts, options.gdal_order ? &scan : nullptr, nullptr);
+  done("assemble");
+}
+
+// cells: h rows of w cells in device memory (host memory on the CPU).  The polygons are GDAL's; with
 // options.gdal_order they also come in GDAL's order (steps/s7_assemble/opt_scan_order.h).
 template <typename T>
 void PolygonizeWhole(const T* cells, int64_t h, int64_t w, const WholeOptions& options, Polygons* out,
@@ -229,18 +253,7 @@ void PolygonizeWhole(const T* cells, int64_t h, int64_t w, const WholeOptions& o
   if (profile != nullptr) DeviceMemory::ResetPeak();
   WholeClock done(profile);
   WholePolygonizer<T> run;
-  run.ToHoles(cells, h, w, options, options.gdal_order, &done);
-  ScanOrder scan;
-  if (options.gdal_order) {
-    FindScanOrder(cells, w, run.lists_, run.edges_, run.pipe_.nxt, run.pipe_.vx, run.pipe_.vy, run.pipe_.rings,
-                  &scan);
-    done("order");
-  }
-  run.pipe_.nxt.Free();
-  run.edges_.Free();
-  run.lists_.Free();
-  run.Assemble(out, counts, options.gdal_order ? &scan : nullptr, nullptr);
-  done("assemble");
+  PolygonizeWholeWith(&run, cells, h, w, options, out, counts, &done);
 }
 
 }  // namespace xrasp

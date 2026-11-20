@@ -7,7 +7,7 @@
 // This directory gives the same names with nothing behind them but that dispatch: every algorithm hands its
 // arguments to the function of the same name that argument-dependent lookup finds for the execution policy
 // (xrasp::CpuPolicy), which is what Thrust does.  Put this directory on the include path instead of Thrust's
-// (XRASP_CPU_SHIM in src/CMakeLists.txt).
+// (cpu/CMakeLists.txt).
 #include <cstddef>
 #include <iterator>
 #include <utility>

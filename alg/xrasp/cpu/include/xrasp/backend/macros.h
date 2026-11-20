@@ -1,17 +1,14 @@
-#ifndef XRASP_UTIL_MACROS_H
-#define XRASP_UTIL_MACROS_H
-// The library builds two ways from the same sources:
+#ifndef XRASP_BACKEND_MACROS_H
+#define XRASP_BACKEND_MACROS_H
+// The CPU backend.  The library has two backends, cpu/ and gpu/, with headers of the same names under
+// xrasp/backend/: a build puts one of the two directories on its include path, and that is the whole choice
+// -- the steps (include/xrasp/steps) are the same text for both and name no backend.
 //
-//   on the GPU (the default)   CUDA: a kernel is a device lambda, one GPU thread per index
-//   on the CPU (XRASP_CPU)     OpenMP: the same lambda in a parallel loop over the indices
-//
-// The steps (steps/*) are the same text in both.  What differs is in util/: this file, launcher.h (how a
-// kernel runs), device_memory.h (where the arrays live, and the sort, the prefix sum and the selection on
-// the CPU) and dev_array.h.
+// Here a kernel is the same lambda in a loop over the indices, split over the threads (launcher.h,
+// threads.h), and "device" memory is host memory.  Standard C++ only: no CUDA, no Thrust (the names of
+// Thrust the steps use are in cpu/include/thrust and do their work in primitives.h).
 #include <cstdio>
 #include <cstdlib>
-
-#ifdef XRASP_CPU
 
 #include <atomic>
 #include <cstddef>
@@ -75,25 +72,16 @@ inline T atomicMin(T* address, xrasp::SameAs<T> value) {
   return old;
 }
 
-#else  // the GPU
+namespace xrasp {
+// A flag that many threads set to the same value.  A write takes the cache line away from every other core,
+// a read does not: write only when the value is not there yet.
+template <typename T>
+inline void SetShared(T* address, const T& value) {
+  if (*address != value) *address = value;
+}
 
-#include <cuda_runtime.h>
+// The kernels read host memory: the cells of a raster are used where they are, nothing is uploaded.
+constexpr bool kKernelsReadHostMemory = true;
+}  // namespace xrasp
 
-// A function that runs on the GPU / on both sides, always inlined.
-#define DEV_INLINE __device__ __forceinline__
-#define DEV_HOST __host__ __device__
-#define DEV_HOST_INLINE __host__ __device__ __forceinline__
-
-#define CUDA_CHECK(call)                                                                  \
-  do {                                                                                    \
-    cudaError_t xrasp_err_ = (call);                                                      \
-    if (xrasp_err_ != cudaSuccess) {                                                      \
-      fprintf(stderr, "CUDA error %s at %s:%d: %s\n", #call, __FILE__, __LINE__,          \
-              cudaGetErrorString(xrasp_err_));                                            \
-      abort();                                                                            \
-    }                                                                                     \
-  } while (0)
-
-#endif
-
-#endif  // XRASP_UTIL_MACROS_H
+#endif  // XRASP_BACKEND_MACROS_H

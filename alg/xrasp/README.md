@@ -82,10 +82,12 @@ repository, `Result.Sequence`), 2026-11-17, 32 cores:
 
 ## Where the code comes from
 
-`include/`, `shim/` and `device_memory.cpp` are copies of the CPU version of
-the X-Rasp library and are not edited here: they are written by
-`src/targets/scripts/sync_gdal` of the X-Rasp repository, and `SYNCED_FROM`
-holds the commit they were taken at. `shim/thrust` stands in for Thrust, whose
-names the steps use; the work behind them is in
-`include/xrasp/util/cpu_primitives.h`, on the threads of
-`include/xrasp/util/cpu_threads.h`, so nothing else is needed.
+`include/` and `cpu/` are copies of the X-Rasp library and are not edited
+here: they are written by `systems/targets/scripts/sync_gdal` of the
+repository of the X-Rasp paper, and `SYNCED_FROM` holds the commit they were
+taken at. `include/` is the algorithm, the same text X-Rasp runs on a GPU;
+`cpu/` is its CPU backend: how a loop over the vertices runs on the threads
+(`cpu/include/xrasp/backend/threads.h`), the sort and the prefix sum
+(`primitives.h`), the memory (`cpu/memory.cpp`), and `cpu/include/thrust`,
+which stands in for the names of Thrust the steps use. Nothing else is
+needed.

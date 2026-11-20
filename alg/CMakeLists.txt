@@ -134,16 +134,15 @@ if (HAVE_AVX_AT_COMPILE_TIME)
 endif ()
 
 # X-Rasp, a parallel polygonizer for GDALPolygonize() (alg/xrasp/README.md), standard C++ that needs nothing
-# GDAL does not have.  Its threads follow GDAL's own choice of OpenMP (GDAL_USE_OPENMP): OpenMP's with it,
-# GDAL's worker threads without it.  A library of its own: the copied sources are not held to GDAL's warning
-# flags.
-add_library(alg_xrasp OBJECT polygonize_xrasp.cpp xrasp/device_memory.cpp)
+# GDAL does not have: xrasp/include is the algorithm, xrasp/cpu its CPU backend.  Its threads follow GDAL's own
+# choice of OpenMP (GDAL_USE_OPENMP): OpenMP's with it, GDAL's worker threads without it.  A library of its
+# own: the copied sources are not held to GDAL's warning flags.
+add_library(alg_xrasp OBJECT polygonize_xrasp.cpp xrasp/cpu/memory.cpp)
 add_dependencies(alg_xrasp generate_gdal_version_h)
 gdal_standard_includes(alg_xrasp)
 target_include_directories(alg_xrasp PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/xrasp/include
-                                             ${CMAKE_CURRENT_SOURCE_DIR}/xrasp/shim)
+                                             ${CMAKE_CURRENT_SOURCE_DIR}/xrasp/cpu/include)
 target_include_directories(alg_xrasp PRIVATE $<TARGET_PROPERTY:gdal_MEM,SOURCE_DIR>)
-target_compile_definitions(alg_xrasp PRIVATE -DXRASP_CPU=1)
 set_property(TARGET alg_xrasp PROPERTY POSITION_INDEPENDENT_CODE ${GDAL_OBJECT_LIBRARIES_POSITION_INDEPENDENT_CODE})
 target_sources(${GDAL_LIB_TARGET_NAME} PRIVATE $<TARGET_OBJECTS:alg_xrasp>)
 

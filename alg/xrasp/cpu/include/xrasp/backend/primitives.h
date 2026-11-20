@@ -1,7 +1,7 @@
-#ifndef XRASP_UTIL_CPU_PRIMITIVES_H
-#define XRASP_UTIL_CPU_PRIMITIVES_H
-// The CPU build (XRASP_CPU): the sort, the prefix sum, the selection and the reductions the steps ask Thrust
-// for, on the threads of util/cpu_threads.h (OpenMP's, or the host's pool).
+#ifndef XRASP_BACKEND_PRIMITIVES_H
+#define XRASP_BACKEND_PRIMITIVES_H
+// The CPU backend: the sort, the prefix sum, the selection and the reductions the steps ask Thrust
+// for, on the threads of threads.h (OpenMP's, or the host's pool).
 //
 // The steps call thrust::sort(Exec(), ...), thrust::inclusive_scan(Exec(), ...) and so on.  On the GPU Exec()
 // is Thrust's CUDA policy.  Here it is CpuPolicy, and the functions below are found for it by
@@ -31,8 +31,8 @@
 #include <thrust/functional.h>
 #include <thrust/system/omp/execution_policy.h>
 
-#include "xrasp/util/cpu_threads.h"
-#include "xrasp/util/macros.h"
+#include "xrasp/backend/threads.h"
+#include "xrasp/backend/macros.h"
 
 namespace xrasp {
 
@@ -302,4 +302,4 @@ void stable_sort_by_key(CpuPolicy&, K* keys_first, K* keys_last, V* values_first
 }
 
 }  // namespace xrasp
-#endif  // XRASP_UTIL_CPU_PRIMITIVES_H
+#endif  // XRASP_BACKEND_PRIMITIVES_H

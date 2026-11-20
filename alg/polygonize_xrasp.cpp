@@ -51,13 +51,13 @@
 #include "ogrsf_frmts.h"
 
 #include "xrasp/core/polygonize_whole.h"
-#include "xrasp/util/cpu_threads.h"
+#include "xrasp/backend/threads.h"
 
 namespace
 {
 
 /** The threads of X-Rasp where GDAL does not use OpenMP: GDAL's worker threads
- * (xrasp/util/cpu_threads.h).  pfnPart(pJob, i) for i = 0 .. nParts-1, the
+ * (xrasp/backend/threads.h).  pfnPart(pJob, i) for i = 0 .. nParts-1, the
  * first on the calling thread, the others on the pool; returns when all are
  * done.  A part the pool does not take runs on the calling thread. */
 void RunOnGDALPool(int nParts, xrasp::CpuPartFn pfnPart, void *pJob)

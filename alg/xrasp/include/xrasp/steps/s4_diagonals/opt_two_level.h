@@ -15,7 +15,7 @@
 #include "xrasp/steps/s3_rank/opt_two_level.h"
 #include "xrasp/steps/s4_diagonals/base.h"
 #include "xrasp/util/dev_array.h"
-#include "xrasp/util/launcher.h"
+#include "xrasp/backend/launcher.h"
 
 namespace xrasp {
 

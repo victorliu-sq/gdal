@@ -9,15 +9,8 @@ template <typename T>
 class DValueView {
  public:
   DEV_HOST_INLINE explicit DValueView(T* data) : data_(data) {}
-#ifdef XRASP_CPU
-  // Many threads set the same flag.  A write takes the cache line away from every other core, a read does
-  // not: write only when the value is not there yet.
-  DEV_INLINE void Set(const T& value) const {
-    if (*data_ != value) *data_ = value;
-  }
-#else
-  DEV_INLINE void Set(const T& value) const { *data_ = value; }
-#endif
+  // many threads may set the same flag (SetShared, backend/macros.h)
+  DEV_INLINE void Set(const T& value) const { SetShared(data_, value); }
   DEV_INLINE T Value() const { return *data_; }
   DEV_HOST_INLINE T* data() const { return data_; }
 
