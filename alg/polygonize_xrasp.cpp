@@ -23,6 +23,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
+#include <climits>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -48,6 +50,7 @@
 #include "memdataset.h"
 #include "ogr_feature.h"
 #include "ogr_geometry.h"
+#include "ogr_recordbatch.h"
 #include "ogrsf_frmts.h"
 
 #include "xrasp/core/polygonize_whole.h"
@@ -340,6 +343,250 @@ CPLErr WriteFeatures(xrasp::Polygons &oPolygons, const int32_t *panOrder,
     return eErr;
 }
 
+/** What the Arrow array is written from: the polygons as X-Rasp has them,
+ * their order, and how a value and a point are written.  No feature is
+ * made.
+ */
+struct ArrowJob
+{
+    xrasp::Polygons oPolygons{};
+    xrasp::DArray<int32_t> oOrder{};
+    GDALGeoTransform gt{};
+    bool bSkipMarker = false;
+    int nFloatBytes = 0;
+    int nThreads = 1;
+};
+
+/** The value of a polygon as the field of its feature has it (see
+ * MakeFeatures()). */
+inline double ValueOfPolygon(int64_t nValue, int nFloatBytes)
+{
+    double dfValue = static_cast<double>(nValue);
+    if (nFloatBytes == 4)
+    {
+        const uint32_t nBits = static_cast<uint32_t>(nValue);
+        float fValue = 0;
+        memcpy(&fValue, &nBits, sizeof(fValue));
+        dfValue = static_cast<double>(fValue);
+    }
+    else if (nFloatBytes == 8)
+    {
+        memcpy(&dfValue, &nValue, sizeof(dfValue));
+    }
+    return dfValue;
+}
+
+/** The bytes of a polygon as ISO WKB: 9 for the polygon, 4 for every ring,
+ * 16 for every point, a ring closed with its first point. */
+inline int64_t WkbSizeOfPolygon(const xrasp::Polygons &oPolygons,
+                                int64_t iPoly)
+{
+    const int64_t *panPolyOffset = oPolygons.poly_offsets.data();
+    const int64_t *panRingOffset = oPolygons.ring_offsets.data();
+    const int64_t nRings = panPolyOffset[iPoly + 1] - panPolyOffset[iPoly];
+    const int64_t nVertices = panRingOffset[panPolyOffset[iPoly + 1]] -
+                              panRingOffset[panPolyOffset[iPoly]];
+    return 9 + 4 * nRings + 16 * (nVertices + nRings);
+}
+
+/** The polygon as little-endian ISO WKB, what OGR_G_ExportToIsoWkb() writes
+ * of the polygon FillFeature() makes. */
+void WritePolygonAsWkb(const xrasp::Polygons &oPolygons, int64_t iPoly,
+                       const GDALGeoTransform &gt, GByte *pabyOut)
+{
+    const int64_t *panPolyOffset = oPolygons.poly_offsets.data();
+    const int64_t *panRingOffset = oPolygons.ring_offsets.data();
+    const int32_t *panX = oPolygons.x.data();
+    const int32_t *panY = oPolygons.y.data();
+    *pabyOut++ = 1;  // wkbNDR
+    const uint32_t nType = 3;  // wkbPolygon
+    memcpy(pabyOut, &nType, 4);
+    pabyOut += 4;
+    const uint32_t nRings =
+        static_cast<uint32_t>(panPolyOffset[iPoly + 1] - panPolyOffset[iPoly]);
+    memcpy(pabyOut, &nRings, 4);
+    pabyOut += 4;
+    for (int64_t iRing = panPolyOffset[iPoly]; iRing < panPolyOffset[iPoly + 1];
+         ++iRing)
+    {
+        const int64_t nFirst = panRingOffset[iRing];
+        const int64_t nPoints = panRingOffset[iRing + 1] - nFirst;
+        const uint32_t nPointsClosed = static_cast<uint32_t>(nPoints + 1);
+        memcpy(pabyOut, &nPointsClosed, 4);
+        pabyOut += 4;
+        for (int64_t i = 0; i <= nPoints; ++i)
+        {
+            const int64_t iVertex = nFirst + (i == nPoints ? 0 : i);
+            double adfXY[2] = {0, 0};
+            gt.Apply(panX[iVertex], panY[iVertex], &adfXY[0], &adfXY[1]);
+            memcpy(pabyOut, adfXY, 16);
+            pabyOut += 16;
+        }
+    }
+}
+
+void ReleaseArrowSchema(struct ArrowSchema *psSchema)
+{
+    for (int64_t i = 0; i < psSchema->n_children; ++i)
+    {
+        if (psSchema->children[i]->release)
+            psSchema->children[i]->release(psSchema->children[i]);
+        CPLFree(psSchema->children[i]);
+    }
+    CPLFree(psSchema->children);
+    psSchema->release = nullptr;
+}
+
+/** struct<geom: binary not null, value: double not null> */
+void InitArrowSchema(struct ArrowSchema *psOut)
+{
+    memset(psOut, 0, sizeof(*psOut));
+    psOut->format = "+s";
+    psOut->name = "";
+    psOut->release = ReleaseArrowSchema;
+    psOut->n_children = 2;
+    psOut->children = static_cast<struct ArrowSchema **>(
+        CPLCalloc(2, sizeof(struct ArrowSchema *)));
+    const char *const apszFormat[2] = {"z", "g"};
+    const char *const apszName[2] = {"geom", "value"};
+    for (int i = 0; i < 2; ++i)
+    {
+        psOut->children[i] = static_cast<struct ArrowSchema *>(
+            CPLCalloc(1, sizeof(struct ArrowSchema)));
+        psOut->children[i]->format = apszFormat[i];
+        psOut->children[i]->name = apszName[i];
+        psOut->children[i]->release = ReleaseArrowSchema;
+    }
+}
+
+void ReleaseArrowArray(struct ArrowArray *psArray)
+{
+    for (int64_t i = 0; i < psArray->n_children; ++i)
+    {
+        if (psArray->children[i]->release)
+            psArray->children[i]->release(psArray->children[i]);
+        CPLFree(psArray->children[i]);
+    }
+    CPLFree(psArray->children);
+    for (int64_t i = 0; i < psArray->n_buffers; ++i)
+        VSIFree(const_cast<void *>(psArray->buffers[i]));
+    CPLFree(psArray->buffers);
+    psArray->release = nullptr;
+}
+
+/** An array of nLength values without nulls and with nBuffers buffers, the
+ * first of which (the validity) is not there. */
+void InitArrowArray(struct ArrowArray *psArray, int64_t nLength, int nBuffers)
+{
+    memset(psArray, 0, sizeof(*psArray));
+    psArray->length = nLength;
+    psArray->n_buffers = nBuffers;
+    psArray->buffers =
+        static_cast<const void **>(CPLCalloc(nBuffers, sizeof(void *)));
+    psArray->release = ReleaseArrowArray;
+}
+
+/** All the polygons as one array, in the order of the default polygonizer:
+ * where the WKB of every polygon starts is known before any is written, so
+ * one block is taken for all of them and all the threads write into it.
+ *
+ * Returns 0, ENOMEM, or EOVERFLOW when the WKB of all the polygons is more
+ * than the 2 GB the offsets of a binary array can say.
+ */
+int WriteArrowArray(const ArrowJob &oJob, struct ArrowArray *psOut)
+{
+    const xrasp::Polygons &oPolygons = oJob.oPolygons;
+    const int64_t nPolygons = oPolygons.num_polygons();
+    const int64_t *panValue = oPolygons.values.data();
+    const int32_t *panOrder = oJob.oOrder.data();
+
+    // the polygons that are written (not those of the marker value) ...
+    std::vector<int32_t> anPoly;
+    int64_t nBytes = 0;
+    try
+    {
+        anPoly.reserve(static_cast<size_t>(nPolygons));
+        for (int64_t i = 0; i < nPolygons; ++i)
+        {
+            const int32_t iPoly = panOrder[i];
+            if (oJob.bSkipMarker &&
+                ValueOfPolygon(panValue[iPoly], oJob.nFloatBytes) ==
+                    GP_NODATA_MARKER)
+            {
+                continue;
+            }
+            nBytes += WkbSizeOfPolygon(oPolygons, iPoly);
+            if (nBytes > INT32_MAX)
+                return EOVERFLOW;
+            anPoly.push_back(iPoly);
+        }
+    }
+    catch (const std::exception &)
+    {
+        return ENOMEM;
+    }
+    const int64_t nCount = static_cast<int64_t>(anPoly.size());
+
+    int32_t *panOffset = static_cast<int32_t *>(
+        VSI_MALLOC2_VERBOSE(static_cast<size_t>(nCount) + 1, 4));
+    GByte *pabyWkb = static_cast<GByte *>(
+        VSI_MALLOC_VERBOSE(static_cast<size_t>(std::max<int64_t>(nBytes, 1))));
+    double *padfValue = static_cast<double *>(VSI_MALLOC2_VERBOSE(
+        static_cast<size_t>(std::max<int64_t>(nCount, 1)), 8));
+    if (panOffset == nullptr || pabyWkb == nullptr || padfValue == nullptr)
+    {
+        VSIFree(panOffset);
+        VSIFree(pabyWkb);
+        VSIFree(padfValue);
+        return ENOMEM;
+    }
+    // ... and where each of them starts
+    panOffset[0] = 0;
+    for (int64_t i = 0; i < nCount; ++i)
+    {
+        panOffset[i + 1] = panOffset[i] + static_cast<int32_t>(
+                                              WkbSizeOfPolygon(oPolygons, anPoly[i]));
+    }
+
+    // polygons differ much in size: every thread takes the next 256
+    std::atomic<int64_t> nNext{0};
+    xrasp::SetCpuPool(RunOnGDALPool);
+    xrasp::RunParts(
+        oJob.nThreads,
+        [&](int)
+        {
+            for (;;)
+            {
+                const int64_t nFirst = nNext.fetch_add(256);
+                if (nFirst >= nCount)
+                    break;
+                const int64_t nEnd = std::min(nFirst + 256, nCount);
+                for (int64_t i = nFirst; i < nEnd; ++i)
+                {
+                    WritePolygonAsWkb(oPolygons, anPoly[i], oJob.gt,
+                                      pabyWkb + panOffset[i]);
+                    padfValue[i] =
+                        ValueOfPolygon(panValue[anPoly[i]], oJob.nFloatBytes);
+                }
+            }
+        });
+
+    InitArrowArray(psOut, nCount, 1);
+    psOut->n_children = 2;
+    psOut->children = static_cast<struct ArrowArray **>(
+        CPLCalloc(2, sizeof(struct ArrowArray *)));
+    psOut->children[0] =
+        static_cast<struct ArrowArray *>(CPLCalloc(1, sizeof(struct ArrowArray)));
+    InitArrowArray(psOut->children[0], nCount, 3);
+    psOut->children[0]->buffers[1] = panOffset;
+    psOut->children[0]->buffers[2] = pabyWkb;
+    psOut->children[1] =
+        static_cast<struct ArrowArray *>(CPLCalloc(1, sizeof(struct ArrowArray)));
+    InitArrowArray(psOut->children[1], nCount, 2);
+    psOut->children[1]->buffers[1] = padfValue;
+    return 0;
+}
+
 /** Whether X-Rasp polygonizes these cells as the default polygonizer does:
  * a check of cells of 64 bits and of floats, with all the threads.
  *
@@ -448,11 +695,14 @@ const T *CellsInPlace(GDALRasterBand *poBand, GDALDataType eDT)
 
 /** eDT: the type the cells are read as.  bFloat: they are floats or doubles
  * (GDT_Float32, GDT_Float64), which X-Rasp takes as their bits (T is uint32_t
- * or uint64_t). */
+ * or uint64_t).  poArrowJob: when given, no feature is written to hOutLayer
+ * (which is not looked at): the polygons and their order are left there, for
+ * an Arrow array to be written from. */
 template <typename T>
 bool Run(GDALRasterBandH hSrcBand, GDALDataType eDT, bool bFloat,
          OGRLayerH hOutLayer, int iPixValField, CSLConstList papszOptions,
-         GDALProgressFunc pfnProgress, void *pProgressArg, CPLErr *peErr)
+         GDALProgressFunc pfnProgress, void *pProgressArg, CPLErr *peErr,
+         ArrowJob *poArrowJob = nullptr)
 {
     const int nXSize = GDALGetRasterBandXSize(hSrcBand);
     const int nYSize = GDALGetRasterBandYSize(hSrcBand);
@@ -579,6 +829,48 @@ bool Run(GDALRasterBandH hSrcBand, GDALDataType eDT, bool bFloat,
         return true;
     }
 
+    if (poArrowJob != nullptr)
+    {
+        // The order of the polygons that end in the same row, with all the
+        // threads: there are no features to make meanwhile.
+        oStart = std::chrono::steady_clock::now();
+        xrasp::DArray<int32_t> oArrowOrder;
+        std::string osArrowError;
+        xrasp::SetCpuThreads(nThreads);
+        try
+        {
+            oPolygonizer.FindOrder(&oArrowOrder, &oOrderProfile);
+        }
+        catch (const std::exception &e)
+        {
+            osArrowError = e.what();
+            if (osArrowError.empty())
+                osArrowError = "failed";
+        }
+        xrasp::SetCpuThreads(nThreadsBefore);
+        VSIFree(paCellsRead);
+        if (!osArrowError.empty())
+        {
+            CPLDebug("GDAL", "X-Rasp: %s; nothing was written",
+                     osArrowError.c_str());
+            return false;
+        }
+        CPLDebug("GDAL",
+                 "X-Rasp: seconds: cells %.2f (%s), polygons %.2f, order "
+                 "%.2f",
+                 dfReadSeconds, bCellsRead ? "read" : "in place",
+                 dfPolygonizeSeconds, Seconds(oStart));
+        poArrowJob->oPolygons = std::move(oPolygons);
+        poArrowJob->oOrder = std::move(oArrowOrder);
+        poArrowJob->gt = gt;
+        poArrowJob->bSkipMarker =
+            eDT == GDT_Int32 || eDT == GDT_Int64 || bFloat;
+        poArrowJob->nFloatBytes = bFloat ? static_cast<int>(sizeof(T)) : 0;
+        poArrowJob->nThreads = nThreads;
+        *peErr = CE_None;
+        return true;
+    }
+
     // What is left to find is the order of the polygons that end in the
     // same row, and what is left to do on this thread is to make the
     // features: the two at the same time, the order on a thread of its own
@@ -690,20 +982,85 @@ bool Run(GDALRasterBandH hSrcBand, GDALDataType eDT, bool bFloat,
 
 }  // namespace
 
-/** What X-Rasp asks of a request, whatever the cells. */
-static bool TakesRequest(GDALRasterBandH hSrcBand, GDALRasterBandH hMaskBand,
-                         OGRLayerH hOutLayer, CSLConstList papszOptions)
+/** What X-Rasp asks of a request, whatever the cells and whatever is written. */
+static bool TakesBand(GDALRasterBandH hSrcBand, GDALRasterBandH hMaskBand,
+                      CSLConstList papszOptions)
 {
-    if (hSrcBand == nullptr || hOutLayer == nullptr || hMaskBand != nullptr)
+    if (hSrcBand == nullptr || hMaskBand != nullptr)
         return false;
     if (CSLFetchNameValue(papszOptions, "8CONNECTED"))
         return false;
     if (!CPLTestBool(CPLGetConfigOption("GDAL_POLYGONIZE_XRASP", "YES")))
         return false;
-    if (!OGR_L_TestCapability(hOutLayer, OLCSequentialWrite))
-        return false;
     return GDALGetRasterBandXSize(hSrcBand) >= 1 &&
            GDALGetRasterBandYSize(hSrcBand) >= 1;
+}
+
+/** What X-Rasp asks of a request that writes features. */
+static bool TakesRequest(GDALRasterBandH hSrcBand, GDALRasterBandH hMaskBand,
+                         OGRLayerH hOutLayer, CSLConstList papszOptions)
+{
+    return hOutLayer != nullptr &&
+           TakesBand(hSrcBand, hMaskBand, papszOptions) &&
+           OGR_L_TestCapability(hOutLayer, OLCSequentialWrite);
+}
+
+/** The cells as GDALFPolygonize() reads them: a Float64 band as doubles and a
+ * band of any other type as floats. */
+static bool RunFloat(GDALRasterBandH hSrcBand, OGRLayerH hOutLayer,
+                     int iPixValField, CSLConstList papszOptions,
+                     GDALProgressFunc pfnProgress, void *pProgressArg,
+                     CPLErr *peErr, ArrowJob *poArrowJob)
+{
+    if (GDALGetRasterDataType(hSrcBand) == GDT_Float64)
+        return Run<uint64_t>(hSrcBand, GDT_Float64, /* bFloat = */ true,
+                             hOutLayer, iPixValField, papszOptions,
+                             pfnProgress, pProgressArg, peErr, poArrowJob);
+    return Run<uint32_t>(hSrcBand, GDT_Float32, /* bFloat = */ true,
+                         hOutLayer, iPixValField, papszOptions, pfnProgress,
+                         pProgressArg, peErr, poArrowJob);
+}
+
+/** The cells as GDALPolygonize() reads them: integers. */
+static bool RunInteger(GDALRasterBandH hSrcBand, OGRLayerH hOutLayer,
+                       int iPixValField, CSLConstList papszOptions,
+                       GDALProgressFunc pfnProgress, void *pProgressArg,
+                       CPLErr *peErr, ArrowJob *poArrowJob)
+{
+    const GDALDataType eDT = GDALGetRasterDataType(hSrcBand);
+    switch (eDT)
+    {
+        case GDT_Byte:
+            return Run<uint8_t>(hSrcBand, eDT, false, hOutLayer, iPixValField,
+                                papszOptions, pfnProgress, pProgressArg,
+                                peErr, poArrowJob);
+        case GDT_Int8:
+            return Run<int8_t>(hSrcBand, eDT, false, hOutLayer, iPixValField,
+                               papszOptions, pfnProgress, pProgressArg, peErr,
+                               poArrowJob);
+        case GDT_UInt16:
+            return Run<uint16_t>(hSrcBand, eDT, false, hOutLayer, iPixValField,
+                                 papszOptions, pfnProgress, pProgressArg,
+                                 peErr, poArrowJob);
+        case GDT_Int16:
+            return Run<int16_t>(hSrcBand, eDT, false, hOutLayer, iPixValField,
+                                papszOptions, pfnProgress, pProgressArg,
+                                peErr, poArrowJob);
+        case GDT_UInt32:
+            return Run<uint32_t>(hSrcBand, eDT, false, hOutLayer, iPixValField,
+                                 papszOptions, pfnProgress, pProgressArg,
+                                 peErr, poArrowJob);
+        case GDT_Int32:
+            return Run<int32_t>(hSrcBand, eDT, false, hOutLayer, iPixValField,
+                                papszOptions, pfnProgress, pProgressArg,
+                                peErr, poArrowJob);
+        default:
+            // Any other band is read as integers of 64 bits, as
+            // GDALPolygonize() reads every band.
+            return Run<int64_t>(hSrcBand, GDT_Int64, false, hOutLayer,
+                                iPixValField, papszOptions, pfnProgress,
+                                pProgressArg, peErr, poArrowJob);
+    }
 }
 
 bool GDALFPolygonizeXRasp(GDALRasterBandH hSrcBand, GDALRasterBandH hMaskBand,
@@ -716,15 +1073,8 @@ bool GDALFPolygonizeXRasp(GDALRasterBandH hSrcBand, GDALRasterBandH hMaskBand,
         return false;
     if (pfnProgress == nullptr)
         pfnProgress = GDALDummyProgress;
-    // GDALFPolygonize() reads a Float64 band as doubles and a band of any
-    // other type as floats.
-    if (GDALGetRasterDataType(hSrcBand) == GDT_Float64)
-        return Run<uint64_t>(hSrcBand, GDT_Float64, /* bFloat = */ true,
-                             hOutLayer, iPixValField, papszOptions,
-                             pfnProgress, pProgressArg, peErr);
-    return Run<uint32_t>(hSrcBand, GDT_Float32, /* bFloat = */ true,
-                         hOutLayer, iPixValField, papszOptions, pfnProgress,
-                         pProgressArg, peErr);
+    return RunFloat(hSrcBand, hOutLayer, iPixValField, papszOptions,
+                    pfnProgress, pProgressArg, peErr, nullptr);
 }
 
 bool GDALPolygonizeXRasp(GDALRasterBandH hSrcBand, GDALRasterBandH hMaskBand,
@@ -737,38 +1087,112 @@ bool GDALPolygonizeXRasp(GDALRasterBandH hSrcBand, GDALRasterBandH hMaskBand,
         return false;
     if (pfnProgress == nullptr)
         pfnProgress = GDALDummyProgress;
+    return RunInteger(hSrcBand, hOutLayer, iPixValField, papszOptions,
+                      pfnProgress, pProgressArg, peErr, nullptr);
+}
 
-    const GDALDataType eDT = GDALGetRasterDataType(hSrcBand);
-    switch (eDT)
+/************************************************************************/
+/*                       GDALPolygonizeToArrow()                        */
+/************************************************************************/
+
+/**
+ * \brief Polygonize a raster band into one Arrow array.
+ *
+ * The polygons GDALPolygonize() (bFloat = FALSE) or GDALFPolygonize()
+ * (bFloat = TRUE) writes to a layer of polygons with one field of type
+ * OFTReal, in the same order, as one struct array of two columns without
+ * nulls: "geom" (binary), the polygon as little-endian ISO WKB, and "value"
+ * (double), the value of its pixels.  No feature and no layer is made: the
+ * WKB of all the polygons is one block of memory, written by all the
+ * threads from the arrays of the polygonizer.
+ *
+ * Only the requests X-Rasp takes are answered (no mask band, 4
+ * connectedness, cells without the cases listed in alg/xrasp/README.md), and
+ * only results of at most 2 GB of WKB, what the offsets of a binary array
+ * can say.  For any other, and with the configuration option
+ * GDAL_POLYGONIZE_ARROW=NO, CE_Failure is returned with CPLE_NotSupported
+ * and the two out parameters are left untouched: the caller polygonizes
+ * into a layer.
+ *
+ * Options: 8CONNECTED (not supported here), DATASET_FOR_GEOREF as for
+ * GDALPolygonize().
+ *
+ * @param hSrcBand the band to polygonize
+ * @param hMaskBand must be NULL
+ * @param bFloat whether the cells are read as GDALFPolygonize() reads them
+ * @param papszOptions see above
+ * @param pfnProgress callback for reporting progress or NULL
+ * @param pProgressArg argument of pfnProgress
+ * @param out_schema the type of the array, to be released by the caller
+ * with out_schema->release(out_schema) when CE_None is returned
+ * @param out_array the array, to be released by the caller with
+ * out_array->release(out_array) when CE_None is returned
+ * @return CE_None on success or CE_Failure
+ */
+CPLErr GDALPolygonizeToArrow(GDALRasterBandH hSrcBand,
+                             GDALRasterBandH hMaskBand, int bFloat,
+                             char **papszOptions, GDALProgressFunc pfnProgress,
+                             void *pProgressArg,
+                             struct ArrowSchema *out_schema,
+                             struct ArrowArray *out_array)
+{
+    VALIDATE_POINTER1(hSrcBand, "GDALPolygonizeToArrow", CE_Failure);
+    VALIDATE_POINTER1(out_schema, "GDALPolygonizeToArrow", CE_Failure);
+    VALIDATE_POINTER1(out_array, "GDALPolygonizeToArrow", CE_Failure);
+    const char *const pszNotSupported =
+        "GDALPolygonizeToArrow(): not a request that is answered without a "
+        "layer";
+    if (!CPL_IS_LSB ||
+        !CPLTestBool(CPLGetConfigOption("GDAL_POLYGONIZE_ARROW", "YES")) ||
+        !TakesBand(hSrcBand, hMaskBand, papszOptions))
     {
-        case GDT_Byte:
-            return Run<uint8_t>(hSrcBand, eDT, false, hOutLayer, iPixValField,
-                                papszOptions, pfnProgress, pProgressArg,
-                                peErr);
-        case GDT_Int8:
-            return Run<int8_t>(hSrcBand, eDT, false, hOutLayer, iPixValField,
-                               papszOptions, pfnProgress, pProgressArg, peErr);
-        case GDT_UInt16:
-            return Run<uint16_t>(hSrcBand, eDT, false, hOutLayer, iPixValField,
-                                 papszOptions, pfnProgress, pProgressArg,
-                                 peErr);
-        case GDT_Int16:
-            return Run<int16_t>(hSrcBand, eDT, false, hOutLayer, iPixValField,
-                                papszOptions, pfnProgress, pProgressArg,
-                                peErr);
-        case GDT_UInt32:
-            return Run<uint32_t>(hSrcBand, eDT, false, hOutLayer, iPixValField,
-                                 papszOptions, pfnProgress, pProgressArg,
-                                 peErr);
-        case GDT_Int32:
-            return Run<int32_t>(hSrcBand, eDT, false, hOutLayer, iPixValField,
-                                papszOptions, pfnProgress, pProgressArg,
-                                peErr);
-        default:
-            // Any other band is read as integers of 64 bits, as
-            // GDALPolygonize() reads every band.
-            return Run<int64_t>(hSrcBand, GDT_Int64, false, hOutLayer,
-                                iPixValField, papszOptions, pfnProgress,
-                                pProgressArg, peErr);
+        CPLError(CE_Failure, CPLE_NotSupported, "%s", pszNotSupported);
+        return CE_Failure;
     }
+    if (pfnProgress == nullptr)
+        pfnProgress = GDALDummyProgress;
+
+    ArrowJob oJob;
+    CPLErr eErr = CE_None;
+    const bool bTaken =
+        bFloat ? RunFloat(hSrcBand, nullptr, -1, papszOptions, pfnProgress,
+                          pProgressArg, &eErr, &oJob)
+               : RunInteger(hSrcBand, nullptr, -1, papszOptions, pfnProgress,
+                            pProgressArg, &eErr, &oJob);
+    if (!bTaken)
+    {
+        CPLError(CE_Failure, CPLE_NotSupported, "%s", pszNotSupported);
+        return CE_Failure;
+    }
+    if (eErr != CE_None)
+        return eErr;
+
+    const auto oStart = std::chrono::steady_clock::now();
+    struct ArrowArray sArray;
+    const int nRet = WriteArrowArray(oJob, &sArray);
+    if (nRet == EOVERFLOW)
+    {
+        CPLError(CE_Failure, CPLE_NotSupported,
+                 "GDALPolygonizeToArrow(): more than 2 GB of WKB");
+        return CE_Failure;
+    }
+    if (nRet != 0)
+    {
+        CPLError(CE_Failure, CPLE_OutOfMemory,
+                 "GDALPolygonizeToArrow(): out of memory");
+        return CE_Failure;
+    }
+    CPLDebug("GDAL",
+             "X-Rasp: seconds: Arrow array written %.2f (" CPL_FRMT_GIB
+             " polygons, %.2f GB of WKB)",
+             Seconds(oStart), static_cast<GIntBig>(sArray.length),
+             sArray.length == 0
+                 ? 0.0
+                 : static_cast<double>(static_cast<const int32_t *>(
+                       sArray.children[0]->buffers[1])[sArray.length]) /
+                       1e9);
+    pfnProgress(1.0, "", pProgressArg);
+    *out_array = sArray;
+    InitArrowSchema(out_schema);
+    return CE_None;
 }

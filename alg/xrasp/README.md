@@ -83,7 +83,7 @@ repository, `Result.Sequence`), 2026-11-17, 32 cores:
 ## Where the code comes from
 
 `include/` and `cpu/` are copies of the X-Rasp library and are not edited
-here: they are written by `systems/targets/scripts/sync_gdal` of the
+here: they are written by `measure/common/targets/scripts/sync_gdal` of the
 repository of the X-Rasp paper, and `SYNCED_FROM` holds the commit they were
 taken at. `include/` is the algorithm, the same text X-Rasp runs on a GPU;
 `cpu/` is its CPU backend: how a loop over the vertices runs on the threads
