@@ -960,6 +960,28 @@ int WriteArrowArrayOfBands(ArrowJob &oJob, struct ArrowArray *psOut,
                            bool *pbLarge)
 {
     WkbColumn &oColumn = oJob.oColumn;
+    {
+        // what the polygonizer still holds: the rings of the polygons whose
+        // outline crosses bands
+        int64_t nHeldVertices = 0;
+        int64_t nHeldRings = 0;
+        for (const auto &oPiece : oJob.poBands->pieces())
+        {
+            nHeldVertices += oPiece.vertices;
+            nHeldRings += oPiece.rings;
+        }
+        CPLDebug("GDAL",
+                 "X-Rasp: before the polygons that cross bands are written: "
+                 CPL_FRMT_GIB " polygons and %.2f GB of WKB written; held: "
+                 CPL_FRMT_GIB " polygons, " CPL_FRMT_GIB " rings, "
+                 CPL_FRMT_GIB " vertices (%.2f GB)",
+                 static_cast<GIntBig>(oColumn.anEnd.size()),
+                 static_cast<double>(oColumn.nBytes) / 1e9,
+                 static_cast<GIntBig>(oJob.poBands->result_values().size()),
+                 static_cast<GIntBig>(nHeldRings),
+                 static_cast<GIntBig>(nHeldVertices),
+                 static_cast<double>(nHeldVertices) * 8 / 1e9);
+    }
     if (oColumn.bNoMemory ||
         !AppendPolygons(oJob, PolygonsOfResult(*oJob.poBands), &oColumn))
     {
