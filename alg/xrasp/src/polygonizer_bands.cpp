@@ -761,6 +761,7 @@ void PolygonizerBands::DrainBands() {
     DeviceSync();
     sink_(band);
     c = Chunk();
+    DeviceMemory::ReturnFreed();                // the band is not memory of the process any more
   }
   chunks_.clear();
 }
@@ -1033,6 +1034,7 @@ void PolygonizerBands::MergeRingsOnDevice() {
   counts_["Polygons"] = npoly;
   counts_["OuterRings"] = nr - nholes;
   counts_["ResultDeviceBytes"] = DeviceMemory::CurrentBytes();    // the raster and the result
+  if (sink_) DeviceMemory::ReturnFreed();      // the arrays of the last steps, before the caller writes
   if (sink_) counts_["RingsGivenToSink"] = n_emitted_rings_;       // rings of polygons a sink took band by band
   counts_["RasterDeviceBytes"] = kKernelsReadHostMemory ? 0 : static_cast<int64_t>(raster_.num_bytes());
 }
