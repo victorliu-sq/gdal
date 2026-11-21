@@ -689,6 +689,45 @@ int WriteArrowArray(const ArrowJob &oJob, struct ArrowArray *psOut)
     return 0;
 }
 
+/** One ring as WKB: the number of its points and the points, the first one
+ * again at the end.  Returns where the next ring goes. */
+inline GByte *WriteRingAsWkb(const int32_t *panX, const int32_t *panY,
+                             int64_t nPoints, const GDALGeoTransform &gt,
+                             GByte *pabyOut)
+{
+    const uint32_t nPointsClosed = static_cast<uint32_t>(nPoints + 1);
+    memcpy(pabyOut, &nPointsClosed, 4);
+    pabyOut += 4;
+    for (int64_t j = 0; j <= nPoints; ++j)
+    {
+        const int64_t iVertex = j == nPoints ? 0 : j;
+        double adfXY[2] = {0, 0};
+        gt.Apply(panX[iVertex], panY[iVertex], &adfXY[0], &adfXY[1]);
+        memcpy(pabyOut, adfXY, 16);
+        pabyOut += 16;
+    }
+    return pabyOut;
+}
+
+/** fn(first, end) on all the threads, for consecutive ranges of nChunk of
+ * 0 .. nCount - 1, each range once. */
+template <typename Fn>
+void ForRanges(int nThreads, int64_t nCount, int64_t nChunk, const Fn &fn)
+{
+    std::atomic<int64_t> nNext{0};
+    xrasp::RunParts(nThreads,
+                    [&](int)
+                    {
+                        for (;;)
+                        {
+                            const int64_t nFirst = nNext.fetch_add(nChunk);
+                            if (nFirst >= nCount)
+                                break;
+                            fn(nFirst, std::min(nFirst + nChunk, nCount));
+                        }
+                    });
+}
+
 /** Polygons appended to the columns.  oSource says what they are:
  *
  *   Count()            the candidates
@@ -697,141 +736,203 @@ int WriteArrowArray(const ArrowJob &oJob, struct ArrowArray *psOut)
  *   FirstRing(i), EndRing(i)   its rings, the outer one first
  *   Ring(k, &x, &y, &n)        the n vertices of ring k (not closed)
  *
- * The bytes of every polygon are counted first, with all the threads; then
- * all the threads write, each polygon at its place.  False when memory ran
- * out (poColumn->bNoMemory).
+ * All the threads count the bytes of every candidate (none for one that is
+ * not written); one pass adds them up to where each polygon starts and which
+ * place it takes; all the threads write, each polygon at its place, with its
+ * end and its value.  Nothing is done polygon by polygon on one thread but
+ * that sum.  A polygon of very many rings (one that crosses the whole raster
+ * may have a million holes) is counted and written ring by ring with all the
+ * threads.  False when memory ran out (poColumn->bNoMemory).
  */
 template <typename Source>
 bool AppendPolygons(const ArrowJob &oJob, const Source &oSource,
                     WkbColumn *poColumn)
 {
     const int64_t nCandidates = oSource.Count();
+    if (nCandidates == 0)
+        return true;
     const GDALGeoTransform &gt = oJob.gt;
-    std::vector<int64_t> anPoly;
+    const int nThreads = oJob.nThreads;
+    constexpr int64_t HUGE_RINGS = 1 << 16;
+    struct HugePolygon
+    {
+        int64_t iPoly;
+        std::vector<int64_t> anRingStart;  // within the polygon's WKB
+    };
+    // anStart[i + 1]: the bytes of candidate i, then (summed) where it ends
     std::vector<int64_t> anStart;
+    std::vector<int64_t> anPlace;
+    std::vector<HugePolygon> aoHuge;
     try
     {
-        anPoly.reserve(static_cast<size_t>(nCandidates));
-        for (int64_t i = 0; i < nCandidates; ++i)
-        {
-            if (!oSource.Complete(i))
-                continue;
-            // the default polygonizer takes a pixel of the marker value for
-            // a masked one
-            if (oJob.bSkipMarker &&
-                ValueOfPolygon(oSource.Value(i), oJob.nFloatBytes) ==
-                    GP_NODATA_MARKER)
-            {
-                continue;
-            }
-            anPoly.push_back(i);
-        }
-        anStart.resize(anPoly.size() + 1);
-        poColumn->anEnd.reserve(poColumn->anEnd.size() + anPoly.size());
-        poColumn->adfValue.reserve(poColumn->adfValue.size() + anPoly.size());
+        anStart.resize(static_cast<size_t>(nCandidates) + 1);
+        anPlace.resize(static_cast<size_t>(nCandidates));
     }
     catch (const std::exception &)
     {
         poColumn->bNoMemory = true;
         return false;
     }
-    const int64_t nCount = static_cast<int64_t>(anPoly.size());
-    if (nCount == 0)
-        return true;
 
     xrasp::SetCpuPool(RunOnGDALPool);
-    {
-        std::atomic<int64_t> nNext{0};
-        xrasp::RunParts(
-            oJob.nThreads,
-            [&](int)
+    ForRanges(
+        nThreads, nCandidates, 4096,
+        [&](int64_t nFirst, int64_t nEnd)
+        {
+            for (int64_t i = nFirst; i < nEnd; ++i)
             {
-                for (;;)
+                anStart[i + 1] = 0;
+                if (!oSource.Complete(i))
+                    continue;
+                // the default polygonizer takes a pixel of the marker value
+                // for a masked one
+                if (oJob.bSkipMarker &&
+                    ValueOfPolygon(oSource.Value(i), oJob.nFloatBytes) ==
+                        GP_NODATA_MARKER)
                 {
-                    const int64_t nFirst = nNext.fetch_add(4096);
-                    if (nFirst >= nCount)
-                        break;
-                    const int64_t nEnd = std::min(nFirst + 4096, nCount);
-                    for (int64_t i = nFirst; i < nEnd; ++i)
-                    {
-                        const int64_t iPoly = anPoly[i];
-                        int64_t nSize = 9;
-                        for (int64_t k = oSource.FirstRing(iPoly);
-                             k < oSource.EndRing(iPoly); ++k)
-                        {
-                            const int32_t *panX = nullptr;
-                            const int32_t *panY = nullptr;
-                            int64_t nPoints = 0;
-                            oSource.Ring(k, &panX, &panY, &nPoints);
-                            nSize += 4 + 16 * (nPoints + 1);
-                        }
-                        anStart[i + 1] = nSize;
-                    }
+                    continue;
                 }
-            });
+                if (oSource.EndRing(i) - oSource.FirstRing(i) >= HUGE_RINGS)
+                {
+                    anStart[i + 1] = -1;  // counted below
+                    continue;
+                }
+                int64_t nSize = 9;
+                for (int64_t k = oSource.FirstRing(i); k < oSource.EndRing(i);
+                     ++k)
+                {
+                    const int32_t *panX = nullptr;
+                    const int32_t *panY = nullptr;
+                    int64_t nPoints = 0;
+                    oSource.Ring(k, &panX, &panY, &nPoints);
+                    nSize += 4 + 16 * (nPoints + 1);
+                }
+                anStart[i + 1] = nSize;
+            }
+        });
+    try
+    {
+        for (int64_t i = 0; i < nCandidates; ++i)
+        {
+            if (anStart[i + 1] == -1)
+                aoHuge.push_back({i, {}});
+        }
+        for (auto &oHuge : aoHuge)
+        {
+            const int64_t nFirstRing = oSource.FirstRing(oHuge.iPoly);
+            const int64_t nRings = oSource.EndRing(oHuge.iPoly) - nFirstRing;
+            oHuge.anRingStart.resize(static_cast<size_t>(nRings) + 1);
+            ForRanges(nThreads, nRings, 1024,
+                      [&](int64_t nFirst, int64_t nEnd)
+                      {
+                          for (int64_t k = nFirst; k < nEnd; ++k)
+                          {
+                              const int32_t *panX = nullptr;
+                              const int32_t *panY = nullptr;
+                              int64_t nPoints = 0;
+                              oSource.Ring(nFirstRing + k, &panX, &panY,
+                                           &nPoints);
+                              oHuge.anRingStart[k + 1] = 4 + 16 * (nPoints + 1);
+                          }
+                      });
+            oHuge.anRingStart[0] = 9;
+            for (int64_t k = 0; k < nRings; ++k)
+                oHuge.anRingStart[k + 1] += oHuge.anRingStart[k];
+            anStart[oHuge.iPoly + 1] = oHuge.anRingStart[nRings];
+        }
     }
-    anStart[0] = 0;
-    for (int64_t i = 0; i < nCount; ++i)
-        anStart[i + 1] += anStart[i];
-    if (!poColumn->Reserve(anStart[nCount]))
+    catch (const std::exception &)
+    {
+        poColumn->bNoMemory = true;
         return false;
-    GByte *const pabyBase = poColumn->pabyWkb + poColumn->nBytes;
+    }
+
+    // where every polygon starts, and its place among those written
+    int64_t nCount = 0;
+    anStart[0] = 0;
+    for (int64_t i = 0; i < nCandidates; ++i)
     {
-        std::atomic<int64_t> nNext{0};
-        xrasp::RunParts(
-            oJob.nThreads,
-            [&](int)
+        anPlace[i] = anStart[i + 1] > 0 ? nCount++ : -1;
+        anStart[i + 1] += anStart[i];
+    }
+    if (nCount == 0)
+        return true;
+    const int64_t nTotal = anStart[nCandidates];
+    const size_t nWritten = poColumn->anEnd.size();
+    if (!poColumn->Reserve(nTotal))
+        return false;
+    try
+    {
+        poColumn->anEnd.resize(nWritten + static_cast<size_t>(nCount));
+        poColumn->adfValue.resize(nWritten + static_cast<size_t>(nCount));
+    }
+    catch (const std::exception &)
+    {
+        poColumn->bNoMemory = true;
+        return false;
+    }
+    const int64_t nBytesBefore = poColumn->nBytes;
+    GByte *const pabyBase = poColumn->pabyWkb + nBytesBefore;
+    int64_t *const panEnd = poColumn->anEnd.data() + nWritten;
+    double *const padfValue = poColumn->adfValue.data() + nWritten;
+    const auto WriteHeader = [&oSource](int64_t iPoly, GByte *pabyOut)
+    {
+        *pabyOut++ = 1;  // wkbNDR
+        const uint32_t nType = 3;  // wkbPolygon
+        memcpy(pabyOut, &nType, 4);
+        pabyOut += 4;
+        const uint32_t nRings = static_cast<uint32_t>(
+            oSource.EndRing(iPoly) - oSource.FirstRing(iPoly));
+        memcpy(pabyOut, &nRings, 4);
+        return pabyOut + 4;
+    };
+    ForRanges(
+        nThreads, nCandidates, 256,
+        [&](int64_t nFirst, int64_t nEnd)
+        {
+            for (int64_t i = nFirst; i < nEnd; ++i)
             {
-                for (;;)
+                if (anPlace[i] < 0)
+                    continue;
+                panEnd[anPlace[i]] = nBytesBefore + anStart[i + 1];
+                padfValue[anPlace[i]] =
+                    ValueOfPolygon(oSource.Value(i), oJob.nFloatBytes);
+                if (oSource.EndRing(i) - oSource.FirstRing(i) >= HUGE_RINGS)
+                    continue;  // written below
+                GByte *pabyOut = WriteHeader(i, pabyBase + anStart[i]);
+                for (int64_t k = oSource.FirstRing(i); k < oSource.EndRing(i);
+                     ++k)
                 {
-                    const int64_t nFirst = nNext.fetch_add(256);
-                    if (nFirst >= nCount)
-                        break;
-                    const int64_t nEnd = std::min(nFirst + 256, nCount);
-                    for (int64_t i = nFirst; i < nEnd; ++i)
-                    {
-                        const int64_t iPoly = anPoly[i];
-                        GByte *pabyOut = pabyBase + anStart[i];
-                        *pabyOut++ = 1;  // wkbNDR
-                        const uint32_t nType = 3;  // wkbPolygon
-                        memcpy(pabyOut, &nType, 4);
-                        pabyOut += 4;
-                        const uint32_t nRings = static_cast<uint32_t>(
-                            oSource.EndRing(iPoly) - oSource.FirstRing(iPoly));
-                        memcpy(pabyOut, &nRings, 4);
-                        pabyOut += 4;
-                        for (int64_t k = oSource.FirstRing(iPoly);
-                             k < oSource.EndRing(iPoly); ++k)
-                        {
-                            const int32_t *panX = nullptr;
-                            const int32_t *panY = nullptr;
-                            int64_t nPoints = 0;
-                            oSource.Ring(k, &panX, &panY, &nPoints);
-                            const uint32_t nPointsClosed =
-                                static_cast<uint32_t>(nPoints + 1);
-                            memcpy(pabyOut, &nPointsClosed, 4);
-                            pabyOut += 4;
-                            for (int64_t j = 0; j <= nPoints; ++j)
-                            {
-                                const int64_t iVertex = j == nPoints ? 0 : j;
-                                double adfXY[2] = {0, 0};
-                                gt.Apply(panX[iVertex], panY[iVertex],
-                                         &adfXY[0], &adfXY[1]);
-                                memcpy(pabyOut, adfXY, 16);
-                                pabyOut += 16;
-                            }
-                        }
-                    }
+                    const int32_t *panX = nullptr;
+                    const int32_t *panY = nullptr;
+                    int64_t nPoints = 0;
+                    oSource.Ring(k, &panX, &panY, &nPoints);
+                    pabyOut = WriteRingAsWkb(panX, panY, nPoints, gt, pabyOut);
                 }
-            });
-    }
-    for (int64_t i = 0; i < nCount; ++i)
+            }
+        });
+    for (const auto &oHuge : aoHuge)
     {
-        poColumn->anEnd.push_back(poColumn->nBytes + anStart[i + 1]);
-        poColumn->adfValue.push_back(
-            ValueOfPolygon(oSource.Value(anPoly[i]), oJob.nFloatBytes));
+        GByte *const pabyPolygon = pabyBase + anStart[oHuge.iPoly];
+        WriteHeader(oHuge.iPoly, pabyPolygon);
+        const int64_t nFirstRing = oSource.FirstRing(oHuge.iPoly);
+        const int64_t nRings =
+            static_cast<int64_t>(oHuge.anRingStart.size()) - 1;
+        ForRanges(nThreads, nRings, 1024,
+                  [&](int64_t nFirst, int64_t nEnd)
+                  {
+                      for (int64_t k = nFirst; k < nEnd; ++k)
+                      {
+                          const int32_t *panX = nullptr;
+                          const int32_t *panY = nullptr;
+                          int64_t nPoints = 0;
+                          oSource.Ring(nFirstRing + k, &panX, &panY, &nPoints);
+                          WriteRingAsWkb(panX, panY, nPoints, gt,
+                                         pabyPolygon + oHuge.anRingStart[k]);
+                      }
+                  });
     }
-    poColumn->nBytes += anStart[nCount];
+    poColumn->nBytes += nTotal;
     return true;
 }
 
