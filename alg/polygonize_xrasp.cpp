@@ -344,6 +344,60 @@ CPLErr WriteFeatures(xrasp::Polygons &oPolygons, const int32_t *panOrder,
     return eErr;
 }
 
+/** The two columns of the array while they grow: polygons are appended as
+ * the bands of the raster are finished.  The WKB of all of them is one block
+ * that is made larger as needed -- more of it is asked for than is written,
+ * and what is not written is not memory of the process yet.
+ */
+struct WkbColumn
+{
+    GByte *pabyWkb = nullptr;
+    int64_t nBytes = 0;
+    int64_t nCapacity = 0;
+    std::vector<int64_t> anEnd{};   // where the WKB of every polygon ends
+    std::vector<double> adfValue{};
+    bool bNoMemory = false;
+
+    WkbColumn() = default;
+    WkbColumn(const WkbColumn &) = delete;
+    WkbColumn &operator=(const WkbColumn &) = delete;
+
+    ~WkbColumn()
+    {
+        VSIFree(pabyWkb);
+    }
+
+    /** Nothing written. */
+    void Reset()
+    {
+        VSIFree(pabyWkb);
+        pabyWkb = nullptr;
+        nBytes = 0;
+        nCapacity = 0;
+        std::vector<int64_t>().swap(anEnd);
+        std::vector<double>().swap(adfValue);
+        bNoMemory = false;
+    }
+
+    bool Reserve(int64_t nMore)
+    {
+        if (nBytes + nMore <= nCapacity)
+            return true;
+        const int64_t nNew = std::max<int64_t>(
+            {2 * nCapacity, nBytes + nMore, int64_t{1} << 26});
+        GByte *pabyNew = static_cast<GByte *>(
+            VSI_REALLOC_VERBOSE(pabyWkb, static_cast<size_t>(nNew)));
+        if (pabyNew == nullptr)
+        {
+            bNoMemory = true;
+            return false;
+        }
+        pabyWkb = pabyNew;
+        nCapacity = nNew;
+        return true;
+    }
+};
+
 /** What the Arrow array is written from: the polygons as X-Rasp has them,
  * their order, and how a value and a point are written.  No feature is
  * made.
@@ -363,6 +417,8 @@ struct ArrowJob
     xrasp::PolygonizeConfig oBandConfig{};
     xrasp::Raster oBandRaster{};
     std::unique_ptr<xrasp::PolygonizerBands> poBands{};
+    // the polygons of the bands written so far (GDAL_POLYGONIZE_BAND_WRITE)
+    WkbColumn oColumn{};
 };
 
 /** The cell type of the band version for T, or false when it has none (cells
@@ -395,49 +451,6 @@ bool InBands(int nXSize, int nYSize)
     if (EQUAL(pszBands, "AUTO"))
         return static_cast<int64_t>(nXSize) * nYSize >= (int64_t{1} << 26);
     return CPLTestBool(pszBands);
-}
-
-/** The polygons of the cells band after band, left in poJob->poBands.
- * Throws what the polygonizer throws. */
-template <typename T>
-void FindPolygonsInBands(const T *paCells, int nXSize, int nYSize,
-                         xrasp::CellType eType, ArrowJob *poJob)
-{
-    xrasp::PolygonizeConfig &oConfig = poJob->oBandConfig;
-    oConfig.mode = "bands";
-    oConfig.band_vertices = static_cast<uint64_t>(CPLAtoGIntBig(
-        CPLGetConfigOption("GDAL_POLYGONIZE_BAND_VERTICES", "2000000")));
-    oConfig.strip_cells = static_cast<uint64_t>(CPLAtoGIntBig(
-        CPLGetConfigOption("GDAL_POLYGONIZE_STRIP_CELLS", "33554432")));
-    oConfig.corner_chunk = 255;
-    oConfig.link_index = true;
-    oConfig.tile = 256;
-    oConfig.rank_walk = true;
-    oConfig.open_walk = true;
-    // everything stays where the polygonizer made it: nothing is copied
-    oConfig.band_on_device = true;
-    xrasp::Raster &oRaster = poJob->oBandRaster;
-    oRaster.h = nYSize;
-    oRaster.w = nXSize;
-    oRaster.type = eType;
-    oRaster.cell_size = sizeof(T);
-    oRaster.UseCells(paCells);
-    auto poBands =
-        std::make_unique<xrasp::PolygonizerBands>(oConfig, oRaster);
-    while (poBands->HasStrips())
-    {
-        poBands->FindVerticesOfNextStrip();
-        if (poBands->BandIsComplete())
-        {
-            poBands->SortBand();
-            poBands->SplitBand();
-            poBands->CloseBandRings();
-            poBands->BandToHost();
-        }
-    }
-    poBands->CloseOpenRings();
-    poBands->MergeRings();
-    poJob->poBands = std::move(poBands);
 }
 
 /** The value of a polygon as the field of its feature has it (see
@@ -671,64 +684,56 @@ int WriteArrowArray(const ArrowJob &oJob, struct ArrowArray *psOut)
     return 0;
 }
 
-/** The polygons found band after band as one array.  The vertices of a ring
- * are in the piece of its band; a polygon lists its rings, the outer one
- * first.  The polygons come in the order of their outer rings: band after
- * band, then those whose outline crosses bands.
+/** Polygons appended to the columns.  oSource says what they are:
  *
- * *pbLarge: the WKB of all the polygons is more than 2 GB, and the offsets of
- * the array are of 64 bits (a large binary array).
+ *   Count()            the candidates
+ *   Complete(i)        whether candidate i is a polygon (all its rings known)
+ *   Value(i)           its value, as the polygonizer has it
+ *   FirstRing(i), EndRing(i)   its rings, the outer one first
+ *   Ring(k, &x, &y, &n)        the n vertices of ring k (not closed)
  *
- * Returns 0 or ENOMEM.
+ * The bytes of every polygon are counted first, with all the threads; then
+ * all the threads write, each polygon at its place.  False when memory ran
+ * out (poColumn->bNoMemory).
  */
-int WriteArrowArrayOfBands(const ArrowJob &oJob, struct ArrowArray *psOut,
-                           bool *pbLarge)
+template <typename Source>
+bool AppendPolygons(const ArrowJob &oJob, const Source &oSource,
+                    WkbColumn *poColumn)
 {
-    const xrasp::PolygonizerBands &oBands = *oJob.poBands;
-    const std::vector<xrasp::PolygonizerBands::Piece> aoPieces =
-        oBands.pieces();
-    const int64_t *panValue = oBands.result_values().data();
-    const int64_t *panPolyOffset = oBands.result_poly_offsets().data();
-    const int64_t *panRingIndex = oBands.result_ring_index().data();
-    const int64_t *panRingOffset = oBands.result_ring_offsets().data();
-    const int64_t nPolygons =
-        static_cast<int64_t>(oBands.result_values().size());
+    const int64_t nCandidates = oSource.Count();
     const GDALGeoTransform &gt = oJob.gt;
-
-    // the polygons that are written (not those of the marker value)
     std::vector<int64_t> anPoly;
-    int64_t *panStart = nullptr;
+    std::vector<int64_t> anStart;
     try
     {
-        anPoly.reserve(static_cast<size_t>(nPolygons));
-        for (int64_t iPoly = 0; iPoly < nPolygons; ++iPoly)
+        anPoly.reserve(static_cast<size_t>(nCandidates));
+        for (int64_t i = 0; i < nCandidates; ++i)
         {
+            if (!oSource.Complete(i))
+                continue;
+            // the default polygonizer takes a pixel of the marker value for
+            // a masked one
             if (oJob.bSkipMarker &&
-                ValueOfPolygon(panValue[iPoly], oJob.nFloatBytes) ==
+                ValueOfPolygon(oSource.Value(i), oJob.nFloatBytes) ==
                     GP_NODATA_MARKER)
             {
                 continue;
             }
-            anPoly.push_back(iPoly);
+            anPoly.push_back(i);
         }
+        anStart.resize(anPoly.size() + 1);
+        poColumn->anEnd.reserve(poColumn->anEnd.size() + anPoly.size());
+        poColumn->adfValue.reserve(poColumn->adfValue.size() + anPoly.size());
     }
     catch (const std::exception &)
     {
-        return ENOMEM;
+        poColumn->bNoMemory = true;
+        return false;
     }
     const int64_t nCount = static_cast<int64_t>(anPoly.size());
-    panStart = static_cast<int64_t *>(
-        VSI_MALLOC2_VERBOSE(static_cast<size_t>(nCount) + 1, 8));
-    double *padfValue = static_cast<double *>(VSI_MALLOC2_VERBOSE(
-        static_cast<size_t>(std::max<int64_t>(nCount, 1)), 8));
-    if (panStart == nullptr || padfValue == nullptr)
-    {
-        VSIFree(panStart);
-        VSIFree(padfValue);
-        return ENOMEM;
-    }
+    if (nCount == 0)
+        return true;
 
-    // the bytes of every polygon, with all the threads, then where each starts
     xrasp::SetCpuPool(RunOnGDALPool);
     {
         std::atomic<int64_t> nNext{0};
@@ -745,36 +750,27 @@ int WriteArrowArrayOfBands(const ArrowJob &oJob, struct ArrowArray *psOut,
                     for (int64_t i = nFirst; i < nEnd; ++i)
                     {
                         const int64_t iPoly = anPoly[i];
-                        int64_t nBytes = 9;
-                        for (int64_t k = panPolyOffset[iPoly];
-                             k < panPolyOffset[iPoly + 1]; ++k)
+                        int64_t nSize = 9;
+                        for (int64_t k = oSource.FirstRing(iPoly);
+                             k < oSource.EndRing(iPoly); ++k)
                         {
-                            const int64_t iRing = panRingIndex[k];
-                            nBytes += 4 + 16 * (panRingOffset[iRing + 1] -
-                                                panRingOffset[iRing] + 1);
+                            const int32_t *panX = nullptr;
+                            const int32_t *panY = nullptr;
+                            int64_t nPoints = 0;
+                            oSource.Ring(k, &panX, &panY, &nPoints);
+                            nSize += 4 + 16 * (nPoints + 1);
                         }
-                        panStart[i + 1] = nBytes;
-                        padfValue[i] =
-                            ValueOfPolygon(panValue[iPoly], oJob.nFloatBytes);
+                        anStart[i + 1] = nSize;
                     }
                 }
             });
     }
-    panStart[0] = 0;
+    anStart[0] = 0;
     for (int64_t i = 0; i < nCount; ++i)
-        panStart[i + 1] += panStart[i];
-    const int64_t nBytes = panStart[nCount];
-    *pbLarge = nBytes > INT32_MAX;
-
-    GByte *pabyWkb = static_cast<GByte *>(
-        VSI_MALLOC_VERBOSE(static_cast<size_t>(std::max<int64_t>(nBytes, 1))));
-    if (pabyWkb == nullptr)
-    {
-        VSIFree(panStart);
-        VSIFree(padfValue);
-        return ENOMEM;
-    }
-    const int64_t nPieces = static_cast<int64_t>(aoPieces.size());
+        anStart[i + 1] += anStart[i];
+    if (!poColumn->Reserve(anStart[nCount]))
+        return false;
+    GByte *const pabyBase = poColumn->pabyWkb + poColumn->nBytes;
     {
         std::atomic<int64_t> nNext{0};
         xrasp::RunParts(
@@ -790,46 +786,31 @@ int WriteArrowArrayOfBands(const ArrowJob &oJob, struct ArrowArray *psOut,
                     for (int64_t i = nFirst; i < nEnd; ++i)
                     {
                         const int64_t iPoly = anPoly[i];
-                        GByte *pabyOut = pabyWkb + panStart[i];
+                        GByte *pabyOut = pabyBase + anStart[i];
                         *pabyOut++ = 1;  // wkbNDR
                         const uint32_t nType = 3;  // wkbPolygon
                         memcpy(pabyOut, &nType, 4);
                         pabyOut += 4;
                         const uint32_t nRings = static_cast<uint32_t>(
-                            panPolyOffset[iPoly + 1] - panPolyOffset[iPoly]);
+                            oSource.EndRing(iPoly) - oSource.FirstRing(iPoly));
                         memcpy(pabyOut, &nRings, 4);
                         pabyOut += 4;
-                        for (int64_t k = panPolyOffset[iPoly];
-                             k < panPolyOffset[iPoly + 1]; ++k)
+                        for (int64_t k = oSource.FirstRing(iPoly);
+                             k < oSource.EndRing(iPoly); ++k)
                         {
-                            const int64_t iRing = panRingIndex[k];
-                            // the piece of the ring: the last that starts
-                            // at or before it
-                            int64_t iLow = 0;
-                            int64_t iHigh = nPieces - 1;
-                            while (iLow < iHigh)
-                            {
-                                const int64_t iMid = (iLow + iHigh + 1) / 2;
-                                if (aoPieces[iMid].first_ring <= iRing)
-                                    iLow = iMid;
-                                else
-                                    iHigh = iMid - 1;
-                            }
-                            const auto &oPiece = aoPieces[iLow];
-                            const int64_t nFirstVertex =
-                                panRingOffset[iRing] - oPiece.first_vertex;
-                            const int64_t nPoints = panRingOffset[iRing + 1] -
-                                                    panRingOffset[iRing];
+                            const int32_t *panX = nullptr;
+                            const int32_t *panY = nullptr;
+                            int64_t nPoints = 0;
+                            oSource.Ring(k, &panX, &panY, &nPoints);
                             const uint32_t nPointsClosed =
                                 static_cast<uint32_t>(nPoints + 1);
                             memcpy(pabyOut, &nPointsClosed, 4);
                             pabyOut += 4;
                             for (int64_t j = 0; j <= nPoints; ++j)
                             {
-                                const int64_t iVertex =
-                                    nFirstVertex + (j == nPoints ? 0 : j);
+                                const int64_t iVertex = j == nPoints ? 0 : j;
                                 double adfXY[2] = {0, 0};
-                                gt.Apply(oPiece.x[iVertex], oPiece.y[iVertex],
+                                gt.Apply(panX[iVertex], panY[iVertex],
                                          &adfXY[0], &adfXY[1]);
                                 memcpy(pabyOut, adfXY, 16);
                                 pabyOut += 16;
@@ -839,25 +820,182 @@ int WriteArrowArrayOfBands(const ArrowJob &oJob, struct ArrowArray *psOut,
                 }
             });
     }
-
-    // offsets of 32 bits where they can say all of it
-    void *pOffsets = panStart;
-    if (!*pbLarge)
+    for (int64_t i = 0; i < nCount; ++i)
     {
-        int32_t *panOffset = static_cast<int32_t *>(
-            VSI_MALLOC2_VERBOSE(static_cast<size_t>(nCount) + 1, 4));
-        if (panOffset == nullptr)
-        {
-            VSIFree(panStart);
-            VSIFree(padfValue);
-            VSIFree(pabyWkb);
-            return ENOMEM;
-        }
-        for (int64_t i = 0; i <= nCount; ++i)
-            panOffset[i] = static_cast<int32_t>(panStart[i]);
-        VSIFree(panStart);
-        pOffsets = panOffset;
+        poColumn->anEnd.push_back(poColumn->nBytes + anStart[i + 1]);
+        poColumn->adfValue.push_back(
+            ValueOfPolygon(oSource.Value(anPoly[i]), oJob.nFloatBytes));
     }
+    poColumn->nBytes += anStart[nCount];
+    return true;
+}
+
+/** The complete polygons of one band, as the polygonizer hands them out when
+ * the band is done (xrasp::BandPolygons). */
+struct PolygonsOfBand
+{
+    const xrasp::BandPolygons &oBand;
+
+    int64_t Count() const
+    {
+        return oBand.groups;
+    }
+    bool Complete(int64_t i) const
+    {
+        return !oBand.is_hole[oBand.order[oBand.group_start[i]]];
+    }
+    int64_t Value(int64_t i) const
+    {
+        return oBand.value[oBand.order[oBand.group_start[i]]];
+    }
+    int64_t FirstRing(int64_t i) const
+    {
+        return oBand.group_start[i];
+    }
+    int64_t EndRing(int64_t i) const
+    {
+        return oBand.group_start[i + 1];
+    }
+    void Ring(int64_t k, const int32_t **ppanX, const int32_t **ppanY,
+              int64_t *pnPoints) const
+    {
+        const int64_t iRing = oBand.order[k];
+        const int64_t nFirst = oBand.ring_offsets[iRing];
+        *ppanX = oBand.x + nFirst;
+        *ppanY = oBand.y + nFirst;
+        *pnPoints = oBand.ring_offsets[iRing + 1] - nFirst;
+    }
+};
+
+/** The polygons the polygonizer holds when all the bands are done: all of
+ * them, or, when the bands were written one by one, those whose outline
+ * crosses bands.  The vertices of a ring are in the piece that holds it. */
+struct PolygonsOfResult
+{
+    std::vector<xrasp::PolygonizerBands::Piece> aoPieces;
+    const int64_t *panValue;
+    const int64_t *panPolyOffset;
+    const int64_t *panRingIndex;
+    const int64_t *panRingOffset;
+    int64_t nPolygons;
+
+    explicit PolygonsOfResult(const xrasp::PolygonizerBands &oBands)
+        : aoPieces(oBands.pieces()), panValue(oBands.result_values().data()),
+          panPolyOffset(oBands.result_poly_offsets().data()),
+          panRingIndex(oBands.result_ring_index().data()),
+          panRingOffset(oBands.result_ring_offsets().data()),
+          nPolygons(static_cast<int64_t>(oBands.result_values().size()))
+    {
+    }
+    int64_t Count() const
+    {
+        return nPolygons;
+    }
+    bool Complete(int64_t) const
+    {
+        return true;
+    }
+    int64_t Value(int64_t i) const
+    {
+        return panValue[i];
+    }
+    int64_t FirstRing(int64_t i) const
+    {
+        return panPolyOffset[i];
+    }
+    int64_t EndRing(int64_t i) const
+    {
+        return panPolyOffset[i + 1];
+    }
+    void Ring(int64_t k, const int32_t **ppanX, const int32_t **ppanY,
+              int64_t *pnPoints) const
+    {
+        const int64_t iRing = panRingIndex[k];
+        // the piece of the ring: the last that starts at or before it
+        int64_t iLow = 0;
+        int64_t iHigh = static_cast<int64_t>(aoPieces.size()) - 1;
+        while (iLow < iHigh)
+        {
+            const int64_t iMid = (iLow + iHigh + 1) / 2;
+            if (aoPieces[iMid].first_ring <= iRing)
+                iLow = iMid;
+            else
+                iHigh = iMid - 1;
+        }
+        const auto &oPiece = aoPieces[iLow];
+        const int64_t nFirst = panRingOffset[iRing] - oPiece.first_vertex;
+        *ppanX = oPiece.x + nFirst;
+        *ppanY = oPiece.y + nFirst;
+        *pnPoints = panRingOffset[iRing + 1] - panRingOffset[iRing];
+    }
+};
+
+/** The polygons found band after band as one array: those the bands wrote
+ * as they were done (in the order of the bands), then those the polygonizer
+ * still holds.  The columns are given to the array.
+ *
+ * *pbLarge: the WKB of all the polygons is more than 2 GB, and the offsets of
+ * the array are of 64 bits (a large binary array).
+ *
+ * Returns 0 or ENOMEM.
+ */
+int WriteArrowArrayOfBands(ArrowJob &oJob, struct ArrowArray *psOut,
+                           bool *pbLarge)
+{
+    WkbColumn &oColumn = oJob.oColumn;
+    if (oColumn.bNoMemory ||
+        !AppendPolygons(oJob, PolygonsOfResult(*oJob.poBands), &oColumn))
+    {
+        return ENOMEM;
+    }
+    // the polygonizer has nothing more to give
+    oJob.poBands.reset();
+    const int64_t nCount = static_cast<int64_t>(oColumn.anEnd.size());
+    const int64_t nBytes = oColumn.nBytes;
+    *pbLarge = nBytes > INT32_MAX;
+
+    const size_t nOffsetSize = *pbLarge ? 8 : 4;
+    void *pOffsets =
+        VSI_MALLOC2_VERBOSE(static_cast<size_t>(nCount) + 1, nOffsetSize);
+    double *padfValue = static_cast<double *>(VSI_MALLOC2_VERBOSE(
+        static_cast<size_t>(std::max<int64_t>(nCount, 1)), 8));
+    if (pOffsets == nullptr || padfValue == nullptr)
+    {
+        VSIFree(pOffsets);
+        VSIFree(padfValue);
+        return ENOMEM;
+    }
+    if (*pbLarge)
+    {
+        int64_t *panOffset = static_cast<int64_t *>(pOffsets);
+        panOffset[0] = 0;
+        for (int64_t i = 0; i < nCount; ++i)
+            panOffset[i + 1] = oColumn.anEnd[i];
+    }
+    else
+    {
+        int32_t *panOffset = static_cast<int32_t *>(pOffsets);
+        panOffset[0] = 0;
+        for (int64_t i = 0; i < nCount; ++i)
+            panOffset[i + 1] = static_cast<int32_t>(oColumn.anEnd[i]);
+    }
+    if (nCount > 0)
+        memcpy(padfValue, oColumn.adfValue.data(),
+               static_cast<size_t>(nCount) * 8);
+    std::vector<int64_t>().swap(oColumn.anEnd);
+    std::vector<double>().swap(oColumn.adfValue);
+    // what was asked for beyond what was written goes back
+    GByte *pabyWkb = static_cast<GByte *>(VSIRealloc(
+        oColumn.pabyWkb, static_cast<size_t>(std::max<int64_t>(nBytes, 1))));
+    if (pabyWkb == nullptr)
+    {
+        VSIFree(pOffsets);
+        VSIFree(padfValue);
+        return ENOMEM;
+    }
+    oColumn.pabyWkb = nullptr;
+    oColumn.nBytes = 0;
+    oColumn.nCapacity = 0;
 
     InitArrowArray(psOut, nCount, 1);
     psOut->n_children = 2;
@@ -873,6 +1011,65 @@ int WriteArrowArrayOfBands(const ArrowJob &oJob, struct ArrowArray *psOut,
     InitArrowArray(psOut->children[1], nCount, 2);
     psOut->children[1]->buffers[1] = padfValue;
     return 0;
+}
+
+/** The polygons of the cells band after band, left in poJob->poBands.
+ * Throws what the polygonizer throws. */
+template <typename T>
+void FindPolygonsInBands(const T *paCells, int nXSize, int nYSize,
+                         xrasp::CellType eType, ArrowJob *poJob)
+{
+    xrasp::PolygonizeConfig &oConfig = poJob->oBandConfig;
+    oConfig.mode = "bands";
+    oConfig.band_vertices = static_cast<uint64_t>(CPLAtoGIntBig(
+        CPLGetConfigOption("GDAL_POLYGONIZE_BAND_VERTICES", "2000000")));
+    oConfig.strip_cells = static_cast<uint64_t>(CPLAtoGIntBig(
+        CPLGetConfigOption("GDAL_POLYGONIZE_STRIP_CELLS", "33554432")));
+    oConfig.corner_chunk = 255;
+    oConfig.link_index = true;
+    oConfig.tile = 256;
+    oConfig.rank_walk = true;
+    oConfig.open_walk = true;
+    // everything stays where the polygonizer made it: nothing is copied
+    oConfig.band_on_device = true;
+    xrasp::Raster &oRaster = poJob->oBandRaster;
+    oRaster.h = nYSize;
+    oRaster.w = nXSize;
+    oRaster.type = eType;
+    oRaster.cell_size = sizeof(T);
+    oRaster.UseCells(paCells);
+    auto poBands =
+        std::make_unique<xrasp::PolygonizerBands>(oConfig, oRaster);
+    // The polygons of a band are written as soon as the band is done, and
+    // their vertices given back: the vertices of all the polygons and their
+    // WKB are then never in memory together (GDAL_POLYGONIZE_BAND_WRITE=NO:
+    // all of them at the end).
+    if (CPLTestBool(CPLGetConfigOption("GDAL_POLYGONIZE_BAND_WRITE", "YES")))
+    {
+        poBands->SetBandSink(
+            [poJob](const xrasp::BandPolygons &oBand)
+            {
+                if (!poJob->oColumn.bNoMemory)
+                    AppendPolygons(*poJob, PolygonsOfBand{oBand},
+                                   &poJob->oColumn);
+            });
+    }
+    while (poBands->HasStrips())
+    {
+        poBands->FindVerticesOfNextStrip();
+        if (poBands->BandIsComplete())
+        {
+            poBands->SortBand();
+            poBands->SplitBand();
+            poBands->CloseBandRings();
+            poBands->BandToHost();
+        }
+    }
+    poBands->CloseOpenRings();
+    poBands->MergeRings();
+    if (poJob->oColumn.bNoMemory)
+        throw std::bad_alloc();
+    poJob->poBands = std::move(poBands);
 }
 
 /** Whether X-Rasp polygonizes these cells as the default polygonizer does:
@@ -1084,6 +1281,12 @@ bool Run(GDALRasterBandH hSrcBand, GDALDataType eDT, bool bFloat,
         BandCellType<T>(&eBandType) && InBands(nXSize, nYSize))
     {
         std::string osBandError;
+        // what the bands read when they write their polygons
+        poArrowJob->gt = gt;
+        poArrowJob->bSkipMarker =
+            eDT == GDT_Int32 || eDT == GDT_Int64 || bFloat;
+        poArrowJob->nFloatBytes = bFloat ? static_cast<int>(sizeof(T)) : 0;
+        poArrowJob->nThreads = nThreads;
         try
         {
             FindPolygonsInBands(paCells, nXSize, nYSize, eBandType,
@@ -1093,6 +1296,7 @@ bool Run(GDALRasterBandH hSrcBand, GDALDataType eDT, bool bFloat,
         {
             // the whole raster at once is tried next
             poArrowJob->poBands.reset();
+            poArrowJob->oColumn.Reset();
             osBandError = e.what();
             if (osBandError.empty())
                 osBandError = "failed";
@@ -1107,14 +1311,10 @@ bool Run(GDALRasterBandH hSrcBand, GDALDataType eDT, bool bFloat,
                      "X-Rasp: " CPL_FRMT_GIB " polygons in bands with %d "
                      "threads (%s); seconds: cells %.2f (%s), polygons %.2f",
                      static_cast<GIntBig>(
+                         poArrowJob->oColumn.anEnd.size() +
                          poArrowJob->poBands->result_values().size()),
                      nThreads, xrasp::CpuThreadsOf(), dfReadSeconds,
                      bCellsRead ? "read" : "in place", Seconds(oStart));
-            poArrowJob->gt = gt;
-            poArrowJob->bSkipMarker =
-                eDT == GDT_Int32 || eDT == GDT_Int64 || bFloat;
-            poArrowJob->nFloatBytes = bFloat ? static_cast<int>(sizeof(T)) : 0;
-            poArrowJob->nThreads = nThreads;
             *peErr = CE_None;
             return true;
         }

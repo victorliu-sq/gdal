@@ -299,6 +299,137 @@ struct IsSet {
   DEV_HOST_INLINE bool operator()(uint8_t v) const { return v != 0; }
 };
 
+// ---- a sink takes the complete polygons of a band (PolygonizerBands::EmitBand) ------------------------------
+// root[r]: the ring the parents of r lead to, in the numbers of the band.  An outer ring leads to itself; so
+// does a hole that waits for its ring (it is among the outlines that cross bands).
+void LocalRoots(const DArray<int64_t>& parent, int64_t ring_base, DArray<int64_t>* root) {
+  const int64_t nr = static_cast<int64_t>(parent.size());
+  root->Reset(nr);
+  {
+    auto p = parent.DeviceView();
+    auto q = root->DeviceView();
+    ForEach(nr, [=] __device__(size_t r) { q[r] = p[r] - ring_base; });
+  }
+  JumpToOuterRing(root);
+}
+
+// offsets[r]: where the vertices of ring r start (one more at the end)
+void RingOffsets(const DArray<int32_t>& length, DArray<int64_t>* offsets) {
+  const int64_t nr = static_cast<int64_t>(length.size());
+  offsets->Reset(nr + 1);
+  auto len = length.DeviceView();
+  auto o = offsets->DeviceView();
+  ForEach(nr + 1, [=] __device__(size_t r) { o[r] = static_cast<int64_t>(r) < nr ? len[r] : 0; });
+  thrust::exclusive_scan(Exec(), offsets->begin(), offsets->end(), offsets->begin());
+}
+
+// start with one more entry, `end`
+void WithEnd(const DArray<int64_t>& start, int64_t end, DArray<int64_t>* out) {
+  const int64_t n = static_cast<int64_t>(start.size());
+  out->Reset(n + 1);
+  auto s = start.DeviceView();
+  auto o = out->DeviceView();
+  ForEach(n + 1, [=] __device__(size_t i) { o[i] = static_cast<int64_t>(i) < n ? s[i] : end; });
+}
+
+// keep[r] = 1 for the rings that stay: those whose root is a hole.  number[r]: how many rings before r stay.
+int64_t RingsThatStay(const DArray<int64_t>& root, const DArray<uint8_t>& is_hole, DArray<uint8_t>* keep,
+                      DArray<int64_t>* number) {
+  const int64_t nr = static_cast<int64_t>(root.size());
+  keep->Reset(nr);
+  number->Reset(nr);
+  {
+    auto q = root.DeviceView();
+    auto h = is_hole.DeviceView();
+    auto k = keep->DeviceView();
+    auto n = number->DeviceView();
+    ForEach(nr, [=] __device__(size_t r) {
+      k[r] = h[q[r]];
+      n[r] = h[q[r]];
+    });
+  }
+  const int64_t count = static_cast<int64_t>(thrust::count_if(Exec(), keep->begin(), keep->end(), IsSet{}));
+  thrust::exclusive_scan(Exec(), number->begin(), number->end(), number->begin());
+  return count;
+}
+
+// out[number[r]] = in[r] for the rings that stay
+template <typename T>
+void TakeKept(const DArray<T>& in, const DArray<uint8_t>& keep, const DArray<int64_t>& number, int64_t count,
+              DArray<T>* out) {
+  out->Reset(count);
+  auto a = in.DeviceView();
+  auto k = keep.DeviceView();
+  auto n = number.DeviceView();
+  auto o = out->DeviceView();
+  ForEach(in.size(), [=] __device__(size_t r) {
+    if (k[r]) o[n[r]] = a[r];
+  });
+}
+
+// The parents of the rings that stay, in the new numbers: a ring and its parent stay together.
+void TakeKeptParents(const DArray<int64_t>& parent, int64_t ring_base, const DArray<uint8_t>& keep,
+                     const DArray<int64_t>& number, int64_t count, DArray<int64_t>* out) {
+  out->Reset(count);
+  auto p = parent.DeviceView();
+  auto k = keep.DeviceView();
+  auto n = number.DeviceView();
+  auto o = out->DeviceView();
+  ForEach(parent.size(), [=] __device__(size_t r) {
+    if (k[r]) o[n[r]] = ring_base + n[p[r] - ring_base];
+  });
+}
+
+// The vertices of the rings that stay, ring after ring (new_offsets: of the kept rings).
+void TakeKeptVertices(const DArray<int32_t>& x, const DArray<int32_t>& y, const DArray<int64_t>& offsets,
+                      const DArray<uint8_t>& keep, const DArray<int64_t>& number,
+                      const DArray<int64_t>& new_offsets, DArray<int32_t>* kx, DArray<int32_t>* ky) {
+  const int64_t nr = static_cast<int64_t>(keep.size());
+  const int64_t count = static_cast<int64_t>(new_offsets.size()) - 1;
+  const int64_t total = count > 0 ? new_offsets.Get(count) : 0;
+  kx->Reset(total);
+  ky->Reset(total);
+  auto vx = x.DeviceView(), vy = y.DeviceView();
+  auto o = offsets.DeviceView(), no = new_offsets.DeviceView();
+  auto k = keep.DeviceView();
+  auto n = number.DeviceView();
+  auto ox = kx->DeviceView(), oy = ky->DeviceView();
+  ForEach(nr, [=] __device__(size_t r) {
+    if (!k[r]) return;
+    const int64_t from = o[r], to = no[n[r]], len = o[r + 1] - o[r];
+    for (int64_t i = 0; i < len; i++) {
+      ox[to + i] = vx[from + i];
+      oy[to + i] = vy[from + i];
+    }
+  });
+}
+
+// The down-entered vertices of the rings that stay, with their rings in the new numbers.
+void TakeKeptIndex(const DArray<int64_t>& pos, const DArray<int64_t>& ring, int64_t ring_base,
+                   const DArray<uint8_t>& keep, const DArray<int64_t>& number, DArray<int64_t>* pos_out,
+                   DArray<int64_t>* ring_out) {
+  const int64_t n0 = static_cast<int64_t>(pos.size());
+  DArray<uint8_t> stays(n0);
+  DArray<int64_t> renumbered(n0);
+  {
+    auto r = ring.DeviceView();
+    auto k = keep.DeviceView();
+    auto n = number.DeviceView();
+    auto s = stays.DeviceView();
+    auto m = renumbered.DeviceView();
+    ForEach(n0, [=] __device__(size_t i) {
+      const int64_t local = r[i] - ring_base;
+      s[i] = k[local];
+      m[i] = ring_base + n[local];
+    });
+  }
+  const int64_t count = static_cast<int64_t>(thrust::count_if(Exec(), stays.begin(), stays.end(), IsSet{}));
+  pos_out->Reset(count);
+  ring_out->Reset(count);
+  thrust::copy_if(Exec(), pos.begin(), pos.end(), stays.data(), pos_out->begin(), IsSet{});
+  thrust::copy_if(Exec(), renumbered.begin(), renumbered.end(), stays.data(), ring_out->begin(), IsSet{});
+}
+
 int64_t CountHoles(const DArray<uint8_t>& is_hole) {
   return static_cast<int64_t>(thrust::count_if(Exec(), is_hole.begin(), is_hole.end(), IsSet{}));
 }
@@ -501,8 +632,17 @@ void PolygonizerBands::BandToHost() {
       DeviceSync();
       tables_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     }
-    ring_base_ += pipe_.rings.nr;
-    chunks_.push_back(std::move(chunk));
+    if (config_.band_on_device && sink_) {
+      // the arrays of the band go first: the sink writes while only the rings are left
+      pipe_ = RingPipeline();
+      lists_.Free();
+      edges_.Free();
+      pos0_all_.Free();
+      owner_.Free();
+      EmitBand(&chunk, &index);
+    }
+    ring_base_ += chunk.n_rings;
+    if (chunk.n_rings > 0) chunks_.push_back(std::move(chunk));
   }
   band_index_.push_back(std::move(index));
   pipe_ = RingPipeline();
@@ -515,6 +655,57 @@ void PolygonizerBands::BandToHost() {
   n_bands_++;
   in_band_ = 0;
   band_first_row_ = next_row_;
+}
+
+// band_on_device with a sink.  The polygons whose outer ring was finished in this band are complete: their
+// holes lie inside that ring, so in this band.  The sink takes them, and they leave the chunk and the index.
+// What stays is the holes that belong to a polygon whose outline crosses bands -- those that wait for their
+// ring and those that lead to such a hole -- in ring numbers of their own.
+void PolygonizerBands::EmitBand(Chunk* chunk, BandIndex* index) {
+  const int64_t nr = chunk->n_rings;
+  DArray<int64_t> root, offsets;
+  LocalRoots(chunk->d_parent, ring_base_, &root);
+  RingOffsets(chunk->d_len, &offsets);
+  {
+    DArray<int64_t> order, start, starts;
+    OrderRingsOnDevice(root, chunk->d_hole, &order, &start);
+    WithEnd(start, nr, &starts);
+    BandPolygons band;
+    band.rings = nr;
+    band.groups = static_cast<int64_t>(start.size());
+    band.x = chunk->dx.data();
+    band.y = chunk->dy.data();
+    band.ring_offsets = offsets.data();
+    band.order = order.data();
+    band.group_start = starts.data();
+    band.is_hole = chunk->d_hole.data();
+    band.value = chunk->d_value.data();
+    DeviceSync();
+    sink_(band);
+  }
+  DArray<uint8_t> keep;
+  DArray<int64_t> number;
+  const int64_t kept = RingsThatStay(root, chunk->d_hole, &keep, &number);
+  root.Free();
+  n_emitted_rings_ += nr - kept;
+  if (kept == nr) return;
+  Chunk rest;
+  rest.n_rings = kept;
+  TakeKept(chunk->d_len, keep, number, kept, &rest.d_len);
+  TakeKept(chunk->d_hole, keep, number, kept, &rest.d_hole);
+  TakeKept(chunk->d_value, keep, number, kept, &rest.d_value);
+  TakeKept(chunk->d_pending, keep, number, kept, &rest.d_pending);
+  TakeKeptParents(chunk->d_parent, ring_base_, keep, number, kept, &rest.d_parent);
+  {
+    DArray<int64_t> new_offsets;
+    RingOffsets(rest.d_len, &new_offsets);
+    TakeKeptVertices(chunk->dx, chunk->dy, offsets, keep, number, new_offsets, &rest.dx, &rest.dy);
+  }
+  DArray<int64_t> pos, ring;
+  TakeKeptIndex(index->d_pos, index->d_ring, ring_base_, keep, number, &pos, &ring);
+  index->d_pos = std::move(pos);
+  index->d_ring = std::move(ring);
+  *chunk = std::move(rest);
 }
 
 // ---- the outlines that left their band: all of them together ------------------------------------------------
@@ -785,6 +976,7 @@ void PolygonizerBands::MergeRingsOnDevice() {
   counts_["Polygons"] = npoly;
   counts_["OuterRings"] = nr - nholes;
   counts_["ResultDeviceBytes"] = DeviceMemory::CurrentBytes();    // the raster and the result
+  if (sink_) counts_["RingsGivenToSink"] = n_emitted_rings_;       // rings of polygons a sink took band by band
   counts_["RasterDeviceBytes"] = kKernelsReadHostMemory ? 0 : static_cast<int64_t>(raster_.num_bytes());
 }
 

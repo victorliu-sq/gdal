@@ -9,6 +9,8 @@
 //
 // core/run_polygonize.cu calls the member functions below in order, band after band.
 #include <cstdint>
+#include <functional>
+#include <utility>
 #include <vector>
 
 #include "xrasp/core/polygonize_config.h"
@@ -20,6 +22,22 @@
 #include "xrasp/util/json.h"
 
 namespace xrasp {
+
+// What a band hands to a sink (PolygonizerBands::SetBandSink) when its rings are finished: the rings of the band
+// one after the other, and the same rings group after group.  A group whose first ring is not a hole is a
+// polygon that is complete -- its outer ring first, then its holes, all of which lie in this band; a group
+// whose first ring is a hole holds holes of a polygon whose outline crosses bands, and is not a polygon yet.
+// The pointers are to device memory (host memory on the CPU) and hold only while the sink runs.
+struct BandPolygons {
+  int64_t rings = 0, groups = 0;
+  const int32_t* x = nullptr;               // the vertices, ring after ring
+  const int32_t* y = nullptr;
+  const int64_t* ring_offsets = nullptr;    // rings + 1: where the vertices of every ring start
+  const int64_t* order = nullptr;           // rings: the rings group after group
+  const int64_t* group_start = nullptr;     // groups + 1: where every group starts in order
+  const uint8_t* is_hole = nullptr;         // rings
+  const int64_t* value = nullptr;           // rings: the value of the ring's block
+};
 
 class PolygonizerBands {
  public:
@@ -35,6 +53,11 @@ class PolygonizerBands {
   void CloseOpenRings();            // s2 .. s5 on the set-aside vertices of all bands, their holes
   void MergeRings();                // waiting holes, polygons, the output arrays
   void ResultToHost();              // band_on_device: the result copied to host memory, for polygons()
+
+  // band_on_device: a host application takes the complete polygons of every band as soon as the band is done
+  // (to write them out), and they are given back: what stays to the end, and what pieces() and result_*() hold
+  // then, is only the polygons whose outline crosses bands.  Set before the first strip.
+  void SetBandSink(std::function<void(const BandPolygons&)> sink) { sink_ = std::move(sink); }
 
   const HostPolygons& polygons() const { return out_; }
   // band_on_device: the result where MergeRings() left it, for a host application that writes it out itself.
@@ -84,6 +107,7 @@ class PolygonizerBands {
   void FindVerticesOfNextStripOfType();
   void RingsToChunk(Chunk* chunk);
   void MergeRingsOnDevice();
+  void EmitBand(Chunk* chunk, BandIndex* index);
 
   const PolygonizeConfig& config_;
   const Raster& raster_;
@@ -111,7 +135,7 @@ class PolygonizerBands {
   std::vector<std::vector<int64_t>> open_[4];   // per direction: the packed set-aside vertices of every band
   std::vector<int64_t> open_pos0_, open_ring0_; // the set-aside down-entered vertices and their rings
   int64_t ring_base_ = 0;
-  int64_t n_bands_ = 0, n_strips_ = 0, n_vertices_ = 0, n_open_ = 0, n_one_block_ = 0;
+  int64_t n_bands_ = 0, n_strips_ = 0, n_vertices_ = 0, n_open_ = 0, n_one_block_ = 0, n_emitted_rings_ = 0;
   double upload_ms_ = 0, tables_ms_ = 0, split_open_ms_ = 0, split_groups_ms_ = 0, split_links_ms_ = 0;
 
   // band_on_device: the raster, the set-aside down-entered vertices with their rings, the tables of the result
@@ -119,6 +143,7 @@ class PolygonizerBands {
   DArray<int64_t> d_open_pos0_, d_open_ring0_;
   DArray<int64_t> r_values_, r_poly_offsets_, r_ring_index_, r_ring_offsets_;
   bool result_on_host_ = false;
+  std::function<void(const BandPolygons&)> sink_;
 
   HostPolygons out_;
   Json counts_;
