@@ -33,5 +33,22 @@ inline void LinkVertices(const VertexLists& lists, DArray<int32_t>* nxt, DArray<
   });
 }
 
+
+// The corners alone, where the next vertices are known already (mode=bands: steps/bands/b1_open_vertices.h).
+inline void CornersOfVertices(const VertexLists& lists, DArray<int32_t>* vx, DArray<int32_t>* vy) {
+  const int64_t nv = lists.size();
+  vx->Reset(nv);
+  vy->Reset(nv);
+  auto L = lists.DeviceView();
+  auto ox = vx->DeviceView();
+  auto oy = vy->DeviceView();
+  ForEach(nv, [=] __device__(size_t v) {
+    int64_t x, y;
+    L.Corner(static_cast<int64_t>(v), &x, &y);
+    ox[v] = static_cast<int32_t>(x);
+    oy[v] = static_cast<int32_t>(y);
+  });
+}
+
 }  // namespace xrasp
 #endif  // XRASP_STEPS_S2_LINKS_BASE_H

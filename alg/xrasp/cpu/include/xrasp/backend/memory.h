@@ -19,6 +19,8 @@ inline void DeviceSync() {}
 inline void CopyToDevice(void* device, const void* host, size_t bytes) { ParallelCopy(device, host, bytes); }
 inline void CopyToHost(void* host, const void* device, size_t bytes) { ParallelCopy(host, device, bytes); }
 inline void CopyOnDevice(void* to, const void* from, size_t bytes) { ParallelCopy(to, from, bytes); }
+// within host memory, with all the threads
+inline void CopyOnHost(void* to, const void* from, size_t bytes) { ParallelCopy(to, from, bytes); }
 
 // What a run reports of where it ran.
 inline const char* BackendName() { return "cpu"; }

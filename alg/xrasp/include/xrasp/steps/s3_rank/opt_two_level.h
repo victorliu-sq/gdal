@@ -26,8 +26,12 @@
 // every ring has one, and the smallest vertex of a ring is one of them: a walk stops at the first vertex
 // smaller than the one it started from, so only the walk from the smallest vertex comes round, and that one
 // writes the ring.  Level 2 and the result are the same; nothing is cut that the jumping version does not cut.
+#include <algorithm>
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <utility>
+#include <vector>
 
 #include <thrust/copy.h>
 #include <thrust/iterator/counting_iterator.h>
@@ -41,6 +45,15 @@
 
 namespace xrasp {
 
+struct RankProfile {
+  // where the time of step 3 goes (milliseconds): the cuts, level 1, the nodes of level 2, their ranking
+  double cuts_ms = 0, level1_ms = 0, nodes_ms = 0, level2_ms = 0;
+  // with XRASP_TILE_STATS set: the vertices per tile -- the most, the median and the 99th percentile over the
+  // tiles that have any, and how many tiles (and the vertices in them) hold more than 6000 and 12000
+  int64_t tile_max = 0, tile_p50 = 0, tile_p99 = 0, tiles_used = 0;
+  int64_t tiles_over_6k = 0, vertices_over_6k = 0, tiles_over_12k = 0, vertices_over_12k = 0;
+};
+
 // What level 2 knows, kept from step 3 to step 4.
 struct TwoLevel {
   int64_t pieces = 0;           // 0: there was no cut, the vertices were ranked the plain way
@@ -52,6 +65,7 @@ struct TwoLevel {
   DArray<int64_t> off2;         // per piece: vertices from its start to the start of the piece holding that vertex
   int rounds1 = 0, rounds2 = 0;
   int64_t walk_cuts = 0;        // walk: the cuts added to the rings that had none
+  RankProfile prof;
 };
 
 // Pointer jumping over rings of pieces: like RankJump, but a step over a piece counts its length.
@@ -115,6 +129,45 @@ inline void RankTwoLevel(const VertexLists& lists, const DArray<int32_t>& nxt, c
                          int tile, DArray<int32_t>* m, DArray<int32_t>* off, TwoLevel* two, bool walk = false) {
   const int64_t nv = static_cast<int64_t>(nxt.size());
   const int64_t tx = (lists.wc + tile - 1) / tile;
+  if (std::getenv("XRASP_TILE_STATS") != nullptr) {
+    const int64_t ty = (lists.hc + tile - 1) / tile;
+    DArray<int32_t> per_tile(tx * ty, 0);
+    {
+      auto x = vx.DeviceView(), y = vy.DeviceView();
+      auto c = per_tile.DeviceView();
+      ForEach(nv, [=] __device__(size_t v) {
+        atomicAdd(&c[static_cast<int64_t>(y[v] / tile) * tx + x[v] / tile], 1);
+      });
+    }
+    std::vector<int32_t> h = per_tile.ToHost();
+    h.erase(std::remove(h.begin(), h.end(), 0), h.end());
+    std::sort(h.begin(), h.end());
+    two->prof.tiles_used = static_cast<int64_t>(h.size());
+    if (!h.empty()) {
+      two->prof.tile_max = h.back();
+      two->prof.tile_p50 = h[h.size() / 2];
+      two->prof.tile_p99 = h[h.size() * 99 / 100];
+      for (int32_t n : h) {
+        if (n > 6000) {
+          two->prof.tiles_over_6k++;
+          two->prof.vertices_over_6k += n;
+        }
+        if (n > 12000) {
+          two->prof.tiles_over_12k++;
+          two->prof.vertices_over_12k += n;
+        }
+      }
+    }
+  }
+  DeviceSync();
+  auto clock = std::chrono::steady_clock::now();
+  auto lap = [&clock]() {
+    DeviceSync();
+    auto now = std::chrono::steady_clock::now();
+    const double ms = std::chrono::duration<double, std::milli>(now - clock).count();
+    clock = now;
+    return ms;
+  };
   // 1 at a cut vertex
   two->cid.Reset(nv);
   {
@@ -147,6 +200,7 @@ inline void RankTwoLevel(const VertexLists& lists, const DArray<int32_t>& nxt, c
   }
   tails_all.Shrink(pieces);
   DArray<int32_t> tails = std::move(tails_all);
+  two->prof.cuts_ms += lap();
 
   if (walk) {
     // level 1 by walking.  state[v]: 1 at a cut vertex, 2 at the other vertices of a piece, 0 on a ring
@@ -218,6 +272,7 @@ inline void RankTwoLevel(const VertexLists& lists, const DArray<int32_t>& nxt, c
     two->rounds1 = RankJump(&j0, &key, m, off);
   }
 
+  two->prof.level1_ms += lap();
   // level 2: one node per piece
   two->nxt2.Reset(pieces);
   two->plen.Reset(pieces);
@@ -240,7 +295,9 @@ inline void RankTwoLevel(const VertexLists& lists, const DArray<int32_t>& nxt, c
       if (vm[v] < 0) atomicMin(&pm[vm[v] + np], static_cast<int32_t>(v));
     });
   }
+  two->prof.nodes_ms += lap();
   two->rounds2 = RankPieces(two->nxt2, two->pmin, two->plen, &two->m2, &two->off2);
+  two->prof.level2_ms += lap();
 }
 
 }  // namespace xrasp

@@ -27,9 +27,15 @@ struct RingPipeline {
   int64_t pairs = 0, one_block = 0;
   int rounds = 0, rounds_level2 = 0, rounds_repair = 0;
   int64_t pieces = 0;
+  RankProfile prof;                       // where the time of step 3 went (two-level)
 
   // s2
   void Link(const VertexLists& lists) { LinkVertices(lists, &nxt, &vx, &vy); }
+  // s2 where the next vertex of every vertex is known already: no search
+  void UseLinks(DArray<int32_t>&& links, const VertexLists& lists) {
+    nxt = std::move(links);
+    CornersOfVertices(lists, &vx, &vy);
+  }
   // s3.  tile = 0: all vertices together; otherwise in two levels with tiles of that size (walk: level 1 by
   // walking every piece instead of pointer jumping)
   // In two levels, giving back what of the lists the later steps do not read (the vertices entered moving
@@ -41,6 +47,7 @@ struct RingPipeline {
     rounds = two.rounds1;
     rounds_level2 = two.rounds2;
     pieces = two.pieces;
+      prof = two.prof;
   }
   void Rank(const VertexLists& lists, int tile, bool walk = false) {
     if (tile > 0) {
@@ -49,6 +56,7 @@ struct RingPipeline {
       rounds = two.rounds1;
       rounds_level2 = two.rounds2;
       pieces = two.pieces;
+      prof = two.prof;
     } else {
       rounds = RankFlat(nxt, &m, &off);
     }
@@ -81,6 +89,20 @@ struct RingPipeline {
       (*counts)["Pieces"] = pieces;
       (*counts)["Level2Rounds"] = rounds_level2;
       if (two.walk_cuts > 0) (*counts)["WalkCuts"] = two.walk_cuts;
+      (*counts)["RankCutsTime"] = prof.cuts_ms;
+      (*counts)["RankLevel1Time"] = prof.level1_ms;
+      (*counts)["RankNodesTime"] = prof.nodes_ms;
+      (*counts)["RankLevel2Time"] = prof.level2_ms;
+      if (prof.tiles_used > 0) {
+        (*counts)["TilesUsed"] = prof.tiles_used;
+        (*counts)["TileVerticesMax"] = prof.tile_max;
+        (*counts)["TileVerticesP50"] = prof.tile_p50;
+        (*counts)["TileVerticesP99"] = prof.tile_p99;
+        (*counts)["TilesOver6000"] = prof.tiles_over_6k;
+        (*counts)["VerticesInTilesOver6000"] = prof.vertices_over_6k;
+        (*counts)["TilesOver12000"] = prof.tiles_over_12k;
+        (*counts)["VerticesInTilesOver12000"] = prof.vertices_over_12k;
+      }
     }
     (*counts)["DiagonalPairs"] = pairs;
     (*counts)["DiagonalPairsOneBlock"] = one_block;

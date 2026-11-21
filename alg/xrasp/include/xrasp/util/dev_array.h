@@ -11,6 +11,7 @@
 #include <thrust/fill.h>
 
 #include "xrasp/util/device_memory.h"
+#include "xrasp/util/host_array.h"
 #include "xrasp/backend/macros.h"
 
 namespace xrasp {
@@ -106,6 +107,13 @@ class DArray {
     std::vector<T> host;
     ToHost(&host);
     return host;
+  }
+  // without the zeros a std::vector writes first
+  void ToHost(HostArray<T>* host) const {
+    host->Reset(size_);
+    if (size_ > 0) {
+      CopyToHost(host->data(), data_, size_ * sizeof(T));
+    }
   }
   // One element, read on the host (slow: for the occasional last element of a prefix sum).
   T Get(size_t i) const {

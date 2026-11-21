@@ -54,6 +54,7 @@
 #include "ogrsf_frmts.h"
 
 #include "xrasp/core/polygonize_whole.h"
+#include "xrasp/core/polygonizer_bands.h"
 #include "xrasp/backend/threads.h"
 
 namespace
@@ -355,7 +356,89 @@ struct ArrowJob
     bool bSkipMarker = false;
     int nFloatBytes = 0;
     int nThreads = 1;
+    // Band after band (GDAL_POLYGONIZE_BANDS): the polygons are here and not
+    // in oPolygons, their vertices in one piece per band.  The polygonizer
+    // refers to the configuration and the raster beside it.
+    bool bBandsAllowed = false;
+    xrasp::PolygonizeConfig oBandConfig{};
+    xrasp::Raster oBandRaster{};
+    std::unique_ptr<xrasp::PolygonizerBands> poBands{};
 };
+
+/** The cell type of the band version for T, or false when it has none (cells
+ * of 64 bits). */
+template <typename T> bool BandCellType(xrasp::CellType *peType)
+{
+    if (sizeof(T) > 4)
+        return false;
+    if (sizeof(T) == 1)
+        *peType = std::is_signed<T>::value ? xrasp::CellType::kI8
+                                           : xrasp::CellType::kU8;
+    else if (sizeof(T) == 2)
+        *peType = std::is_signed<T>::value ? xrasp::CellType::kI16
+                                           : xrasp::CellType::kU16;
+    else
+        *peType = std::is_signed<T>::value ? xrasp::CellType::kI32
+                                           : xrasp::CellType::kU32;
+    return true;
+}
+
+/** Whether a raster of this many cells is polygonized band after band:
+ * GDAL_POLYGONIZE_BANDS = YES, NO or AUTO (the default: from 2^26 cells on).
+ * In bands the arrays of the polygonizer are those of one band, a few million
+ * vertices, where the whole raster at once needs them for all its vertices;
+ * the polygons are the same, in another order (see GDALPolygonizeToArrow()).
+ */
+bool InBands(int nXSize, int nYSize)
+{
+    const char *pszBands = CPLGetConfigOption("GDAL_POLYGONIZE_BANDS", "AUTO");
+    if (EQUAL(pszBands, "AUTO"))
+        return static_cast<int64_t>(nXSize) * nYSize >= (int64_t{1} << 26);
+    return CPLTestBool(pszBands);
+}
+
+/** The polygons of the cells band after band, left in poJob->poBands.
+ * Throws what the polygonizer throws. */
+template <typename T>
+void FindPolygonsInBands(const T *paCells, int nXSize, int nYSize,
+                         xrasp::CellType eType, ArrowJob *poJob)
+{
+    xrasp::PolygonizeConfig &oConfig = poJob->oBandConfig;
+    oConfig.mode = "bands";
+    oConfig.band_vertices = static_cast<uint64_t>(CPLAtoGIntBig(
+        CPLGetConfigOption("GDAL_POLYGONIZE_BAND_VERTICES", "2000000")));
+    oConfig.strip_cells = static_cast<uint64_t>(CPLAtoGIntBig(
+        CPLGetConfigOption("GDAL_POLYGONIZE_STRIP_CELLS", "33554432")));
+    oConfig.corner_chunk = 255;
+    oConfig.link_index = true;
+    oConfig.tile = 256;
+    oConfig.rank_walk = true;
+    oConfig.open_walk = true;
+    // everything stays where the polygonizer made it: nothing is copied
+    oConfig.band_on_device = true;
+    xrasp::Raster &oRaster = poJob->oBandRaster;
+    oRaster.h = nYSize;
+    oRaster.w = nXSize;
+    oRaster.type = eType;
+    oRaster.cell_size = sizeof(T);
+    oRaster.UseCells(paCells);
+    auto poBands =
+        std::make_unique<xrasp::PolygonizerBands>(oConfig, oRaster);
+    while (poBands->HasStrips())
+    {
+        poBands->FindVerticesOfNextStrip();
+        if (poBands->BandIsComplete())
+        {
+            poBands->SortBand();
+            poBands->SplitBand();
+            poBands->CloseBandRings();
+            poBands->BandToHost();
+        }
+    }
+    poBands->CloseOpenRings();
+    poBands->MergeRings();
+    poJob->poBands = std::move(poBands);
+}
 
 /** The value of a polygon as the field of its feature has it (see
  * MakeFeatures()). */
@@ -437,8 +520,9 @@ void ReleaseArrowSchema(struct ArrowSchema *psSchema)
     psSchema->release = nullptr;
 }
 
-/** struct<geom: binary not null, value: double not null> */
-void InitArrowSchema(struct ArrowSchema *psOut)
+/** struct<geom: binary not null, value: double not null>; bLarge: geom is a
+ * large binary (offsets of 64 bits). */
+void InitArrowSchema(struct ArrowSchema *psOut, bool bLarge)
 {
     memset(psOut, 0, sizeof(*psOut));
     psOut->format = "+s";
@@ -447,7 +531,7 @@ void InitArrowSchema(struct ArrowSchema *psOut)
     psOut->n_children = 2;
     psOut->children = static_cast<struct ArrowSchema **>(
         CPLCalloc(2, sizeof(struct ArrowSchema *)));
-    const char *const apszFormat[2] = {"z", "g"};
+    const char *const apszFormat[2] = {bLarge ? "Z" : "z", "g"};
     const char *const apszName[2] = {"geom", "value"};
     for (int i = 0; i < 2; ++i)
     {
@@ -579,6 +663,210 @@ int WriteArrowArray(const ArrowJob &oJob, struct ArrowArray *psOut)
         static_cast<struct ArrowArray *>(CPLCalloc(1, sizeof(struct ArrowArray)));
     InitArrowArray(psOut->children[0], nCount, 3);
     psOut->children[0]->buffers[1] = panOffset;
+    psOut->children[0]->buffers[2] = pabyWkb;
+    psOut->children[1] =
+        static_cast<struct ArrowArray *>(CPLCalloc(1, sizeof(struct ArrowArray)));
+    InitArrowArray(psOut->children[1], nCount, 2);
+    psOut->children[1]->buffers[1] = padfValue;
+    return 0;
+}
+
+/** The polygons found band after band as one array.  The vertices of a ring
+ * are in the piece of its band; a polygon lists its rings, the outer one
+ * first.  The polygons come in the order of their outer rings: band after
+ * band, then those whose outline crosses bands.
+ *
+ * *pbLarge: the WKB of all the polygons is more than 2 GB, and the offsets of
+ * the array are of 64 bits (a large binary array).
+ *
+ * Returns 0 or ENOMEM.
+ */
+int WriteArrowArrayOfBands(const ArrowJob &oJob, struct ArrowArray *psOut,
+                           bool *pbLarge)
+{
+    const xrasp::PolygonizerBands &oBands = *oJob.poBands;
+    const std::vector<xrasp::PolygonizerBands::Piece> aoPieces =
+        oBands.pieces();
+    const int64_t *panValue = oBands.result_values().data();
+    const int64_t *panPolyOffset = oBands.result_poly_offsets().data();
+    const int64_t *panRingIndex = oBands.result_ring_index().data();
+    const int64_t *panRingOffset = oBands.result_ring_offsets().data();
+    const int64_t nPolygons =
+        static_cast<int64_t>(oBands.result_values().size());
+    const GDALGeoTransform &gt = oJob.gt;
+
+    // the polygons that are written (not those of the marker value)
+    std::vector<int64_t> anPoly;
+    int64_t *panStart = nullptr;
+    try
+    {
+        anPoly.reserve(static_cast<size_t>(nPolygons));
+        for (int64_t iPoly = 0; iPoly < nPolygons; ++iPoly)
+        {
+            if (oJob.bSkipMarker &&
+                ValueOfPolygon(panValue[iPoly], oJob.nFloatBytes) ==
+                    GP_NODATA_MARKER)
+            {
+                continue;
+            }
+            anPoly.push_back(iPoly);
+        }
+    }
+    catch (const std::exception &)
+    {
+        return ENOMEM;
+    }
+    const int64_t nCount = static_cast<int64_t>(anPoly.size());
+    panStart = static_cast<int64_t *>(
+        VSI_MALLOC2_VERBOSE(static_cast<size_t>(nCount) + 1, 8));
+    double *padfValue = static_cast<double *>(VSI_MALLOC2_VERBOSE(
+        static_cast<size_t>(std::max<int64_t>(nCount, 1)), 8));
+    if (panStart == nullptr || padfValue == nullptr)
+    {
+        VSIFree(panStart);
+        VSIFree(padfValue);
+        return ENOMEM;
+    }
+
+    // the bytes of every polygon, with all the threads, then where each starts
+    xrasp::SetCpuPool(RunOnGDALPool);
+    {
+        std::atomic<int64_t> nNext{0};
+        xrasp::RunParts(
+            oJob.nThreads,
+            [&](int)
+            {
+                for (;;)
+                {
+                    const int64_t nFirst = nNext.fetch_add(4096);
+                    if (nFirst >= nCount)
+                        break;
+                    const int64_t nEnd = std::min(nFirst + 4096, nCount);
+                    for (int64_t i = nFirst; i < nEnd; ++i)
+                    {
+                        const int64_t iPoly = anPoly[i];
+                        int64_t nBytes = 9;
+                        for (int64_t k = panPolyOffset[iPoly];
+                             k < panPolyOffset[iPoly + 1]; ++k)
+                        {
+                            const int64_t iRing = panRingIndex[k];
+                            nBytes += 4 + 16 * (panRingOffset[iRing + 1] -
+                                                panRingOffset[iRing] + 1);
+                        }
+                        panStart[i + 1] = nBytes;
+                        padfValue[i] =
+                            ValueOfPolygon(panValue[iPoly], oJob.nFloatBytes);
+                    }
+                }
+            });
+    }
+    panStart[0] = 0;
+    for (int64_t i = 0; i < nCount; ++i)
+        panStart[i + 1] += panStart[i];
+    const int64_t nBytes = panStart[nCount];
+    *pbLarge = nBytes > INT32_MAX;
+
+    GByte *pabyWkb = static_cast<GByte *>(
+        VSI_MALLOC_VERBOSE(static_cast<size_t>(std::max<int64_t>(nBytes, 1))));
+    if (pabyWkb == nullptr)
+    {
+        VSIFree(panStart);
+        VSIFree(padfValue);
+        return ENOMEM;
+    }
+    const int64_t nPieces = static_cast<int64_t>(aoPieces.size());
+    {
+        std::atomic<int64_t> nNext{0};
+        xrasp::RunParts(
+            oJob.nThreads,
+            [&](int)
+            {
+                for (;;)
+                {
+                    const int64_t nFirst = nNext.fetch_add(256);
+                    if (nFirst >= nCount)
+                        break;
+                    const int64_t nEnd = std::min(nFirst + 256, nCount);
+                    for (int64_t i = nFirst; i < nEnd; ++i)
+                    {
+                        const int64_t iPoly = anPoly[i];
+                        GByte *pabyOut = pabyWkb + panStart[i];
+                        *pabyOut++ = 1;  // wkbNDR
+                        const uint32_t nType = 3;  // wkbPolygon
+                        memcpy(pabyOut, &nType, 4);
+                        pabyOut += 4;
+                        const uint32_t nRings = static_cast<uint32_t>(
+                            panPolyOffset[iPoly + 1] - panPolyOffset[iPoly]);
+                        memcpy(pabyOut, &nRings, 4);
+                        pabyOut += 4;
+                        for (int64_t k = panPolyOffset[iPoly];
+                             k < panPolyOffset[iPoly + 1]; ++k)
+                        {
+                            const int64_t iRing = panRingIndex[k];
+                            // the piece of the ring: the last that starts
+                            // at or before it
+                            int64_t iLow = 0;
+                            int64_t iHigh = nPieces - 1;
+                            while (iLow < iHigh)
+                            {
+                                const int64_t iMid = (iLow + iHigh + 1) / 2;
+                                if (aoPieces[iMid].first_ring <= iRing)
+                                    iLow = iMid;
+                                else
+                                    iHigh = iMid - 1;
+                            }
+                            const auto &oPiece = aoPieces[iLow];
+                            const int64_t nFirstVertex =
+                                panRingOffset[iRing] - oPiece.first_vertex;
+                            const int64_t nPoints = panRingOffset[iRing + 1] -
+                                                    panRingOffset[iRing];
+                            const uint32_t nPointsClosed =
+                                static_cast<uint32_t>(nPoints + 1);
+                            memcpy(pabyOut, &nPointsClosed, 4);
+                            pabyOut += 4;
+                            for (int64_t j = 0; j <= nPoints; ++j)
+                            {
+                                const int64_t iVertex =
+                                    nFirstVertex + (j == nPoints ? 0 : j);
+                                double adfXY[2] = {0, 0};
+                                gt.Apply(oPiece.x[iVertex], oPiece.y[iVertex],
+                                         &adfXY[0], &adfXY[1]);
+                                memcpy(pabyOut, adfXY, 16);
+                                pabyOut += 16;
+                            }
+                        }
+                    }
+                }
+            });
+    }
+
+    // offsets of 32 bits where they can say all of it
+    void *pOffsets = panStart;
+    if (!*pbLarge)
+    {
+        int32_t *panOffset = static_cast<int32_t *>(
+            VSI_MALLOC2_VERBOSE(static_cast<size_t>(nCount) + 1, 4));
+        if (panOffset == nullptr)
+        {
+            VSIFree(panStart);
+            VSIFree(padfValue);
+            VSIFree(pabyWkb);
+            return ENOMEM;
+        }
+        for (int64_t i = 0; i <= nCount; ++i)
+            panOffset[i] = static_cast<int32_t>(panStart[i]);
+        VSIFree(panStart);
+        pOffsets = panOffset;
+    }
+
+    InitArrowArray(psOut, nCount, 1);
+    psOut->n_children = 2;
+    psOut->children = static_cast<struct ArrowArray **>(
+        CPLCalloc(2, sizeof(struct ArrowArray *)));
+    psOut->children[0] =
+        static_cast<struct ArrowArray *>(CPLCalloc(1, sizeof(struct ArrowArray)));
+    InitArrowArray(psOut->children[0], nCount, 3);
+    psOut->children[0]->buffers[1] = pOffsets;
     psOut->children[0]->buffers[2] = pabyWkb;
     psOut->children[1] =
         static_cast<struct ArrowArray *>(CPLCalloc(1, sizeof(struct ArrowArray)));
@@ -790,6 +1078,48 @@ bool Run(GDALRasterBandH hSrcBand, GDALDataType eDT, bool bFloat,
                           "the same, or a cell of -0 as a double"
                         : "a cell of the smallest value of 64 bits");
         return false;
+    }
+    xrasp::CellType eBandType = xrasp::CellType::kU8;
+    if (poArrowJob != nullptr && poArrowJob->bBandsAllowed &&
+        BandCellType<T>(&eBandType) && InBands(nXSize, nYSize))
+    {
+        std::string osBandError;
+        try
+        {
+            FindPolygonsInBands(paCells, nXSize, nYSize, eBandType,
+                                poArrowJob);
+        }
+        catch (const std::exception &e)
+        {
+            // the whole raster at once is tried next
+            poArrowJob->poBands.reset();
+            osBandError = e.what();
+            if (osBandError.empty())
+                osBandError = "failed";
+        }
+        if (osBandError.empty())
+        {
+            xrasp::SetCpuThreads(nThreadsBefore);
+            // the vertices are in the pieces, the values read: the cells
+            // are not needed any more
+            VSIFree(paCellsRead);
+            CPLDebug("GDAL",
+                     "X-Rasp: " CPL_FRMT_GIB " polygons in bands with %d "
+                     "threads (%s); seconds: cells %.2f (%s), polygons %.2f",
+                     static_cast<GIntBig>(
+                         poArrowJob->poBands->result_values().size()),
+                     nThreads, xrasp::CpuThreadsOf(), dfReadSeconds,
+                     bCellsRead ? "read" : "in place", Seconds(oStart));
+            poArrowJob->gt = gt;
+            poArrowJob->bSkipMarker =
+                eDT == GDT_Int32 || eDT == GDT_Int64 || bFloat;
+            poArrowJob->nFloatBytes = bFloat ? static_cast<int>(sizeof(T)) : 0;
+            poArrowJob->nThreads = nThreads;
+            *peErr = CE_None;
+            return true;
+        }
+        CPLDebug("GDAL", "X-Rasp: bands: %s; the whole raster at once",
+                 osBandError.c_str());
     }
     bool bDone = false;
     try
@@ -1106,10 +1436,20 @@ bool GDALPolygonizeXRasp(GDALRasterBandH hSrcBand, GDALRasterBandH hMaskBand,
  * WKB of all the polygons is one block of memory, written by all the
  * threads from the arrays of the polygonizer.
  *
+ * A large raster is polygonized band after band (configuration option
+ * GDAL_POLYGONIZE_BANDS = YES, NO or AUTO, the default: from 2^26 cells on;
+ * not for cells of 64 bits).  The arrays of the polygonizer are then those of
+ * one band, not of the whole raster.  The polygons are the same, but not in
+ * the order of GDALPolygonize(): they come band after band, the holes of a
+ * polygon in the order they were found, and a ring starts at another of its
+ * vertices.  When their WKB is more than 2 GB, "geom" is a large binary
+ * array (offsets of 64 bits): the caller reads the format of the schema.
+ * Without bands the order is that of GDALPolygonize() and results of more
+ * than 2 GB of WKB are not answered.
+ *
  * Only the requests X-Rasp takes are answered (no mask band, 4
- * connectedness, cells without the cases listed in alg/xrasp/README.md), and
- * only results of at most 2 GB of WKB, what the offsets of a binary array
- * can say.  For any other, and with the configuration option
+ * connectedness, cells without the cases listed in alg/xrasp/README.md).
+ * For any other, and with the configuration option
  * GDAL_POLYGONIZE_ARROW=NO, CE_Failure is returned with CPLE_NotSupported
  * and the two out parameters are left untouched: the caller polygonizes
  * into a layer.
@@ -1153,6 +1493,7 @@ CPLErr GDALPolygonizeToArrow(GDALRasterBandH hSrcBand,
         pfnProgress = GDALDummyProgress;
 
     ArrowJob oJob;
+    oJob.bBandsAllowed = true;
     CPLErr eErr = CE_None;
     const bool bTaken =
         bFloat ? RunFloat(hSrcBand, nullptr, -1, papszOptions, pfnProgress,
@@ -1169,7 +1510,9 @@ CPLErr GDALPolygonizeToArrow(GDALRasterBandH hSrcBand,
 
     const auto oStart = std::chrono::steady_clock::now();
     struct ArrowArray sArray;
-    const int nRet = WriteArrowArray(oJob, &sArray);
+    bool bLarge = false;
+    const int nRet = oJob.poBands ? WriteArrowArrayOfBands(oJob, &sArray, &bLarge)
+                                  : WriteArrowArray(oJob, &sArray);
     if (nRet == EOVERFLOW)
     {
         CPLError(CE_Failure, CPLE_NotSupported,
@@ -1182,17 +1525,22 @@ CPLErr GDALPolygonizeToArrow(GDALRasterBandH hSrcBand,
                  "GDALPolygonizeToArrow(): out of memory");
         return CE_Failure;
     }
-    CPLDebug("GDAL",
-             "X-Rasp: seconds: Arrow array written %.2f (" CPL_FRMT_GIB
-             " polygons, %.2f GB of WKB)",
-             Seconds(oStart), static_cast<GIntBig>(sArray.length),
-             sArray.length == 0
-                 ? 0.0
-                 : static_cast<double>(static_cast<const int32_t *>(
-                       sArray.children[0]->buffers[1])[sArray.length]) /
-                       1e9);
+    {
+        const void *pOffsets = sArray.children[0]->buffers[1];
+        const int64_t nWkbBytes =
+            sArray.length == 0
+                ? 0
+                : bLarge ? static_cast<const int64_t *>(pOffsets)[sArray.length]
+                         : static_cast<const int32_t *>(pOffsets)[sArray.length];
+        CPLDebug("GDAL",
+                 "X-Rasp: seconds: Arrow array written %.2f (" CPL_FRMT_GIB
+                 " polygons, %.2f GB of WKB%s)",
+                 Seconds(oStart), static_cast<GIntBig>(sArray.length),
+                 static_cast<double>(nWkbBytes) / 1e9,
+                 bLarge ? ", offsets of 64 bits" : "");
+    }
     pfnProgress(1.0, "", pProgressArg);
     *out_array = sArray;
-    InitArrowSchema(out_schema);
+    InitArrowSchema(out_schema, bLarge);
     return CE_None;
 }
