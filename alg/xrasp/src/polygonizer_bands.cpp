@@ -746,6 +746,7 @@ void PolygonizerBands::DrainBands() {
   for (auto& c : chunks_) {
     if (c.n_all == 0) c = Chunk();
   }
+  int64_t held = DeviceMemory::CurrentBytes();
   for (auto& c : chunks_) {
     if (c.n_all == 0) continue;
     BandPolygons band;
@@ -761,8 +762,14 @@ void PolygonizerBands::DrainBands() {
     DeviceSync();
     sink_(band);
     c = Chunk();
-    DeviceMemory::ReturnFreed();                // the band is not memory of the process any more
+    // what was given back is not memory of the process any more: every quarter of a gigabyte (the allocator
+    // walks its whole heap for this)
+    if (held - DeviceMemory::CurrentBytes() >= (int64_t{1} << 28)) {
+      DeviceMemory::ReturnFreed();
+      held = DeviceMemory::CurrentBytes();
+    }
   }
+  DeviceMemory::ReturnFreed();
   chunks_.clear();
 }
 
