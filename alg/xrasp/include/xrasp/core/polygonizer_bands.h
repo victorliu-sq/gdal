@@ -57,22 +57,37 @@ class PolygonizerBands {
   // band_on_device: a host application takes the complete polygons of every band as soon as the band is done
   // (to write them out), and they are given back: what stays to the end, and what pieces() and result_*() hold
   // then, is only the polygons whose outline crosses bands.  Set before the first strip.
-  void SetBandSink(std::function<void(const BandPolygons&)> sink) { sink_ = std::move(sink); }
+  //
+  // at_end = false: the sink is called when a band is done, between two bands.
+  // at_end = true: nothing is handed out while the raster is polygonized; the bands stay as they are, and
+  // DrainBands() hands them out one by one afterwards, each given back as soon as the sink returns.  The
+  // caller takes the polygons that cross bands (pieces(), result_*()) BEFORE it drains: their holes are
+  // rings of the bands.
+  void SetBandSink(std::function<void(const BandPolygons&)> sink, bool at_end = false) {
+    sink_ = std::move(sink);
+    sink_at_end_ = at_end;
+  }
+  void DrainBands();
 
   const HostPolygons& polygons() const { return out_; }
   // band_on_device: the result where MergeRings() left it, for a host application that writes it out itself.
   // The tables are those of structs/host_polygons.h with ring_index; the vertices of ring r are in the piece
   // that holds it, pieces()[k] holding rings first_ring .. first_ring + rings - 1 one after the other.
+  // ring_starts: null when the vertices of the piece's rings follow each other from the start of x (ring r
+  // then starts at ring_offsets[r] - ring_offsets[first_ring]); otherwise where each of the piece's rings
+  // starts in x (a band that still holds the polygons it has to hand out: DrainBands()).
   struct Piece {
     const int32_t* x;
     const int32_t* y;
     int64_t vertices, rings, first_ring, first_vertex;
+    const int64_t* ring_starts;
   };
   std::vector<Piece> pieces() const {
     std::vector<Piece> all;
     int64_t ring = 0, vertex = 0;
     for (const auto& c : chunks_) {
-      all.push_back({c.dx.data(), c.dy.data(), static_cast<int64_t>(c.dx.size()), c.n_rings, ring, vertex});
+      all.push_back({c.dx.data(), c.dy.data(), static_cast<int64_t>(c.dx.size()), c.n_rings, ring, vertex,
+                     c.d_start.empty() ? nullptr : c.d_start.data()});
       ring += c.n_rings;
       vertex += static_cast<int64_t>(c.dx.size());
     }
@@ -96,6 +111,12 @@ class PolygonizerBands {
     DArray<uint8_t> d_hole;
     DArray<int64_t> d_parent, d_pending, d_value;
     int64_t n_rings = 0;
+    // a band that waits to be drained (sink at the end): dx, dy are all its rings; d_start says where the
+    // n_rings rings that stay start in them; and its rings as the sink gets them
+    DArray<int64_t> d_start;
+    DArray<int64_t> a_offsets, a_order, a_groups, a_value;
+    DArray<uint8_t> a_hole;
+    int64_t n_all = 0, n_groups = 0;
   };
   // the down-entered vertices of the rings finished in a band: sorted positions and their (global) rings
   struct BandIndex {
@@ -144,6 +165,7 @@ class PolygonizerBands {
   DArray<int64_t> r_values_, r_poly_offsets_, r_ring_index_, r_ring_offsets_;
   bool result_on_host_ = false;
   std::function<void(const BandPolygons&)> sink_;
+  bool sink_at_end_ = false;
 
   HostPolygons out_;
   Json counts_;

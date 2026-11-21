@@ -417,8 +417,10 @@ struct ArrowJob
     xrasp::PolygonizeConfig oBandConfig{};
     xrasp::Raster oBandRaster{};
     std::unique_ptr<xrasp::PolygonizerBands> poBands{};
-    // the polygons of the bands written so far (GDAL_POLYGONIZE_BAND_WRITE)
+    // the polygons written so far (GDAL_POLYGONIZE_BAND_WRITE), and whether
+    // the bands are still to be drained
     WkbColumn oColumn{};
+    bool bDrainBands = false;
 };
 
 /** The cell type of the band version for T, or false when it has none (cells
@@ -923,16 +925,31 @@ struct PolygonsOfResult
                 iHigh = iMid - 1;
         }
         const auto &oPiece = aoPieces[iLow];
-        const int64_t nFirst = panRingOffset[iRing] - oPiece.first_vertex;
+        // a band that is still whole says where each of these rings starts
+        // in it; otherwise the rings of the piece follow each other
+        const int64_t nFirst =
+            oPiece.ring_starts
+                ? oPiece.ring_starts[iRing - oPiece.first_ring]
+                : panRingOffset[iRing] - panRingOffset[oPiece.first_ring];
         *ppanX = oPiece.x + nFirst;
         *ppanY = oPiece.y + nFirst;
         *pnPoints = panRingOffset[iRing + 1] - panRingOffset[iRing];
     }
 };
 
-/** The polygons found band after band as one array: those the bands wrote
- * as they were done (in the order of the bands), then those the polygonizer
- * still holds.  The columns are given to the array.
+/** The polygons found band after band as one array.  The columns are given
+ * to the array.
+ *
+ * GDAL_POLYGONIZE_BAND_WRITE says when the polygons become WKB:
+ *
+ *   AFTER (the default)  when the raster is polygonized: first the polygons
+ *       whose outline crosses bands, then the bands one by one, each given
+ *       back as soon as it is written.  While the raster is polygonized
+ *       there is no WKB, and while the WKB is written there are no arrays
+ *       of the polygonizer: the vertices of a band are 8 bytes a point, its
+ *       WKB 16.
+ *   YES   as every band is done (then the polygons that cross bands).
+ *   NO    all at the end, and nothing is given back before all is written.
  *
  * *pbLarge: the WKB of all the polygons is more than 2 GB, and the offsets of
  * the array are of 64 bits (a large binary array).
@@ -947,6 +964,13 @@ int WriteArrowArrayOfBands(ArrowJob &oJob, struct ArrowArray *psOut,
         !AppendPolygons(oJob, PolygonsOfResult(*oJob.poBands), &oColumn))
     {
         return ENOMEM;
+    }
+    if (oJob.bDrainBands)
+    {
+        // the sink set in FindPolygonsInBands() appends band after band
+        oJob.poBands->DrainBands();
+        if (oColumn.bNoMemory)
+            return ENOMEM;
     }
     // the polygonizer has nothing more to give
     oJob.poBands.reset();
@@ -1040,11 +1064,12 @@ void FindPolygonsInBands(const T *paCells, int nXSize, int nYSize,
     oRaster.UseCells(paCells);
     auto poBands =
         std::make_unique<xrasp::PolygonizerBands>(oConfig, oRaster);
-    // The polygons of a band are written as soon as the band is done, and
-    // their vertices given back: the vertices of all the polygons and their
-    // WKB are then never in memory together (GDAL_POLYGONIZE_BAND_WRITE=NO:
-    // all of them at the end).
-    if (CPLTestBool(CPLGetConfigOption("GDAL_POLYGONIZE_BAND_WRITE", "YES")))
+    // When the polygons become WKB: see WriteArrowArrayOfBands().
+    const char *pszWrite =
+        CPLGetConfigOption("GDAL_POLYGONIZE_BAND_WRITE", "AFTER");
+    const bool bAfter = EQUAL(pszWrite, "AFTER");
+    poJob->bDrainBands = false;
+    if (bAfter || CPLTestBool(pszWrite))
     {
         poBands->SetBandSink(
             [poJob](const xrasp::BandPolygons &oBand)
@@ -1052,7 +1077,9 @@ void FindPolygonsInBands(const T *paCells, int nXSize, int nYSize,
                 if (!poJob->oColumn.bNoMemory)
                     AppendPolygons(*poJob, PolygonsOfBand{oBand},
                                    &poJob->oColumn);
-            });
+            },
+            /* at_end = */ bAfter);
+        poJob->bDrainBands = bAfter;
     }
     while (poBands->HasStrips())
     {

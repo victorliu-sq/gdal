@@ -367,6 +367,19 @@ void TakeKept(const DArray<T>& in, const DArray<uint8_t>& keep, const DArray<int
   });
 }
 
+// out[number[r]] = offsets[r] for the rings that stay: where each of them starts among the vertices of the band
+void TakeKeptStarts(const DArray<int64_t>& offsets, const DArray<uint8_t>& keep, const DArray<int64_t>& number,
+                    int64_t count, DArray<int64_t>* out) {
+  out->Reset(count);
+  auto a = offsets.DeviceView();
+  auto k = keep.DeviceView();
+  auto n = number.DeviceView();
+  auto o = out->DeviceView();
+  ForEach(keep.size(), [=] __device__(size_t r) {
+    if (k[r]) o[n[r]] = a[r];
+  });
+}
+
 // The parents of the rings that stay, in the new numbers: a ring and its parent stay together.
 void TakeKeptParents(const DArray<int64_t>& parent, int64_t ring_base, const DArray<uint8_t>& keep,
                      const DArray<int64_t>& number, int64_t count, DArray<int64_t>* out) {
@@ -642,7 +655,7 @@ void PolygonizerBands::BandToHost() {
       EmitBand(&chunk, &index);
     }
     ring_base_ += chunk.n_rings;
-    if (chunk.n_rings > 0) chunks_.push_back(std::move(chunk));
+    if (chunk.n_rings > 0 || chunk.n_all > 0) chunks_.push_back(std::move(chunk));
   }
   band_index_.push_back(std::move(index));
   pipe_ = RingPipeline();
@@ -663,16 +676,19 @@ void PolygonizerBands::BandToHost() {
 // ring and those that lead to such a hole -- in ring numbers of their own.
 void PolygonizerBands::EmitBand(Chunk* chunk, BandIndex* index) {
   const int64_t nr = chunk->n_rings;
-  DArray<int64_t> root, offsets;
+  DArray<int64_t> root, offsets, order, starts;
   LocalRoots(chunk->d_parent, ring_base_, &root);
   RingOffsets(chunk->d_len, &offsets);
   {
-    DArray<int64_t> order, start, starts;
+    DArray<int64_t> start;
     OrderRingsOnDevice(root, chunk->d_hole, &order, &start);
     WithEnd(start, nr, &starts);
+  }
+  const int64_t groups = static_cast<int64_t>(starts.size()) - 1;
+  if (!sink_at_end_) {
     BandPolygons band;
     band.rings = nr;
-    band.groups = static_cast<int64_t>(start.size());
+    band.groups = groups;
     band.x = chunk->dx.data();
     band.y = chunk->dy.data();
     band.ring_offsets = offsets.data();
@@ -688,7 +704,7 @@ void PolygonizerBands::EmitBand(Chunk* chunk, BandIndex* index) {
   const int64_t kept = RingsThatStay(root, chunk->d_hole, &keep, &number);
   root.Free();
   n_emitted_rings_ += nr - kept;
-  if (kept == nr) return;
+  if (kept == nr) return;                       // no polygon of this band is complete: it stays as it is
   Chunk rest;
   rest.n_rings = kept;
   TakeKept(chunk->d_len, keep, number, kept, &rest.d_len);
@@ -696,7 +712,19 @@ void PolygonizerBands::EmitBand(Chunk* chunk, BandIndex* index) {
   TakeKept(chunk->d_value, keep, number, kept, &rest.d_value);
   TakeKept(chunk->d_pending, keep, number, kept, &rest.d_pending);
   TakeKeptParents(chunk->d_parent, ring_base_, keep, number, kept, &rest.d_parent);
-  {
+  if (sink_at_end_) {
+    // the band is drained later: its vertices stay where they are, the rings that stay are found in them
+    TakeKeptStarts(offsets, keep, number, kept, &rest.d_start);
+    rest.dx = std::move(chunk->dx);
+    rest.dy = std::move(chunk->dy);
+    rest.a_offsets = std::move(offsets);
+    rest.a_order = std::move(order);
+    rest.a_groups = std::move(starts);
+    rest.a_hole = std::move(chunk->d_hole);
+    rest.a_value = std::move(chunk->d_value);
+    rest.n_all = nr;
+    rest.n_groups = groups;
+  } else {
     DArray<int64_t> new_offsets;
     RingOffsets(rest.d_len, &new_offsets);
     TakeKeptVertices(chunk->dx, chunk->dy, offsets, keep, number, new_offsets, &rest.dx, &rest.dy);
@@ -706,6 +734,35 @@ void PolygonizerBands::EmitBand(Chunk* chunk, BandIndex* index) {
   index->d_pos = std::move(pos);
   index->d_ring = std::move(ring);
   *chunk = std::move(rest);
+}
+
+// Sink at the end: the bands hand out their complete polygons one by one, and each is given back when the sink
+// returns.  What the caller had of the polygons that cross bands goes first: it is not valid any more.
+void PolygonizerBands::DrainBands() {
+  r_values_.Free();
+  r_poly_offsets_.Free();
+  r_ring_index_.Free();
+  r_ring_offsets_.Free();
+  for (auto& c : chunks_) {
+    if (c.n_all == 0) c = Chunk();
+  }
+  for (auto& c : chunks_) {
+    if (c.n_all == 0) continue;
+    BandPolygons band;
+    band.rings = c.n_all;
+    band.groups = c.n_groups;
+    band.x = c.dx.data();
+    band.y = c.dy.data();
+    band.ring_offsets = c.a_offsets.data();
+    band.order = c.a_order.data();
+    band.group_start = c.a_groups.data();
+    band.is_hole = c.a_hole.data();
+    band.value = c.a_value.data();
+    DeviceSync();
+    sink_(band);
+    c = Chunk();
+  }
+  chunks_.clear();
 }
 
 // ---- the outlines that left their band: all of them together ------------------------------------------------
