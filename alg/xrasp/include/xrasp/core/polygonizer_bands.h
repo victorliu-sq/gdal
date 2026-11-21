@@ -68,6 +68,9 @@ class PolygonizerBands {
     sink_at_end_ = at_end;
   }
   void DrainBands();
+  // milliseconds spent on handing the bands to the sink: all of it, and of that inside the sink itself
+  double emit_ms() const { return emit_ms_; }
+  double sink_ms() const { return sink_ms_; }
 
   const HostPolygons& polygons() const { return out_; }
   // band_on_device: the result where MergeRings() left it, for a host application that writes it out itself.
@@ -166,6 +169,7 @@ class PolygonizerBands {
   bool result_on_host_ = false;
   std::function<void(const BandPolygons&)> sink_;
   bool sink_at_end_ = false;
+  double emit_ms_ = 0, sink_ms_ = 0;
 
   HostPolygons out_;
   Json counts_;

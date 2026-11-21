@@ -676,6 +676,11 @@ void PolygonizerBands::BandToHost() {
 // ring and those that lead to such a hole -- in ring numbers of their own.
 void PolygonizerBands::EmitBand(Chunk* chunk, BandIndex* index) {
   const int64_t nr = chunk->n_rings;
+  struct Timed {
+    double* ms;
+    std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+    ~Timed() { *ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
+  } timed{&emit_ms_};
   DArray<int64_t> root, offsets, order, starts;
   LocalRoots(chunk->d_parent, ring_base_, &root);
   RingOffsets(chunk->d_len, &offsets);
@@ -697,7 +702,9 @@ void PolygonizerBands::EmitBand(Chunk* chunk, BandIndex* index) {
     band.is_hole = chunk->d_hole.data();
     band.value = chunk->d_value.data();
     DeviceSync();
+    auto t_sink = std::chrono::steady_clock::now();
     sink_(band);
+    sink_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_sink).count();
   }
   DArray<uint8_t> keep;
   DArray<int64_t> number;
@@ -760,7 +767,10 @@ void PolygonizerBands::DrainBands() {
     band.is_hole = c.a_hole.data();
     band.value = c.a_value.data();
     DeviceSync();
+    auto t_sink = std::chrono::steady_clock::now();
     sink_(band);
+    sink_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_sink).count();
+    emit_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_sink).count();
     c = Chunk();
     // what was given back is not memory of the process any more: every quarter of a gigabyte (the allocator
     // walks its whole heap for this)

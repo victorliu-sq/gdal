@@ -421,6 +421,9 @@ struct ArrowJob
     // the bands are still to be drained
     WkbColumn oColumn{};
     bool bDrainBands = false;
+    // seconds, for CPL_DEBUG: inside the polygonizer handing bands out (of that, writing their WKB)
+    double dfEmitSeconds = 0;
+    double dfSinkSeconds = 0;
 };
 
 /** The cell type of the band version for T, or false when it has none (cells
@@ -982,11 +985,14 @@ int WriteArrowArrayOfBands(ArrowJob &oJob, struct ArrowArray *psOut,
                  static_cast<GIntBig>(nHeldVertices),
                  static_cast<double>(nHeldVertices) * 8 / 1e9);
     }
+    const auto oCrossStart = std::chrono::steady_clock::now();
     if (oColumn.bNoMemory ||
         !AppendPolygons(oJob, PolygonsOfResult(*oJob.poBands), &oColumn))
     {
         return ENOMEM;
     }
+    const double dfCrossSeconds = Seconds(oCrossStart);
+    const auto oDrainStart = std::chrono::steady_clock::now();
     if (oJob.bDrainBands)
     {
         // the sink set in FindPolygonsInBands() appends band after band
@@ -994,8 +1000,10 @@ int WriteArrowArrayOfBands(ArrowJob &oJob, struct ArrowArray *psOut,
         if (oColumn.bNoMemory)
             return ENOMEM;
     }
+    const double dfDrainSeconds = Seconds(oDrainStart);
     // the polygonizer has nothing more to give
     oJob.poBands.reset();
+    const auto oFinishStart = std::chrono::steady_clock::now();
     const int64_t nCount = static_cast<int64_t>(oColumn.anEnd.size());
     const int64_t nBytes = oColumn.nBytes;
     *pbLarge = nBytes > INT32_MAX;
@@ -1050,6 +1058,11 @@ int WriteArrowArrayOfBands(ArrowJob &oJob, struct ArrowArray *psOut,
     psOut->children[0] =
         static_cast<struct ArrowArray *>(CPLCalloc(1, sizeof(struct ArrowArray)));
     InitArrowArray(psOut->children[0], nCount, 3);
+    CPLDebug("GDAL",
+             "X-Rasp: bands: seconds after the polygonizer: WKB of the polygons "
+             "that cross bands %.2f, draining the bands %.2f, the columns of "
+             "the array %.2f",
+             dfCrossSeconds, dfDrainSeconds, Seconds(oFinishStart));
     psOut->children[0]->buffers[1] = pOffsets;
     psOut->children[0]->buffers[2] = pabyWkb;
     psOut->children[1] =
@@ -1103,6 +1116,7 @@ void FindPolygonsInBands(const T *paCells, int nXSize, int nYSize,
             /* at_end = */ bAfter);
         poJob->bDrainBands = bAfter;
     }
+    const auto oBandsStart = std::chrono::steady_clock::now();
     while (poBands->HasStrips())
     {
         poBands->FindVerticesOfNextStrip();
@@ -1114,10 +1128,22 @@ void FindPolygonsInBands(const T *paCells, int nXSize, int nYSize,
             poBands->BandToHost();
         }
     }
+    const auto oBandsDone = std::chrono::steady_clock::now();
     poBands->CloseOpenRings();
+    const double dfOpenSeconds = Seconds(oBandsDone);
+    const auto oOpenDone = std::chrono::steady_clock::now();
     poBands->MergeRings();
     if (poJob->oColumn.bNoMemory)
         throw std::bad_alloc();
+    poJob->dfEmitSeconds = poBands->emit_ms() / 1000;
+    poJob->dfSinkSeconds = poBands->sink_ms() / 1000;
+    CPLDebug("GDAL",
+             "X-Rasp: bands: seconds: the bands %.2f (of that handing their "
+             "polygons out %.2f, of that writing WKB %.2f), the rings that "
+             "cross bands %.2f, merging %.2f",
+             std::chrono::duration<double>(oBandsDone - oBandsStart).count(),
+             poJob->dfEmitSeconds, poJob->dfSinkSeconds, dfOpenSeconds,
+             Seconds(oOpenDone));
     poJob->poBands = std::move(poBands);
 }
 
