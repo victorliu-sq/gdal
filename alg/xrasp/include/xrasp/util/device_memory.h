@@ -29,6 +29,9 @@ class DeviceMemory {
   static int64_t CurrentBytes();
   static int64_t PeakBytes();
   static void ResetPeak();
+  // Memory that was given back with Deallocate() and that the allocator still holds goes back to the
+  // operating system, where the backend can do that (the CPU with glibc); nothing otherwise.
+  static void ReturnFreed();
   // Free and total memory of the GPU as the driver reports them (of the host in the CPU build).
   static void DeviceBytes(size_t* free_bytes, size_t* total_bytes);
 };

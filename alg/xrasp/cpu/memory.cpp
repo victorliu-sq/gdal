@@ -8,6 +8,9 @@
 #include <optional>
 #include <stdexcept>
 
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 namespace xrasp {
 
@@ -41,6 +44,14 @@ int64_t DeviceMemory::CurrentBytes() { return g_current.load(); }
 int64_t DeviceMemory::PeakBytes() { return g_peak.load(); }
 
 void DeviceMemory::ResetPeak() { g_peak.store(g_current.load()); }
+
+// glibc keeps what is freed inside its heap (an array of a band, a few megabytes, is not a mapping of its own):
+// the pages of the free chunks are handed back here.
+void DeviceMemory::ReturnFreed() {
+#if defined(__GLIBC__)
+  malloc_trim(0);
+#endif
+}
 
 // DeviceBytes is in host_memory.cpp, which asks the operating system: what is here is standard C++ only and
 // goes into GDAL as it is.
