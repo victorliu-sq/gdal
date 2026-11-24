@@ -20,6 +20,7 @@
 
 #include "xrasp/structs/vertex_lists.h"
 #include "xrasp/util/dev_array.h"
+#include "xrasp/util/parts.h"
 #include "xrasp/backend/launcher.h"
 
 namespace xrasp {
@@ -77,9 +78,11 @@ inline void LinkInsideBand(const VertexLists& lists, DArray<int32_t>* j_out, DAr
 inline void FindOpenVerticesByWalk(const VertexLists& lists, DArray<uint8_t>* open,
                                    DArray<int32_t>* links = nullptr) {
   const int64_t nv = lists.size();
+  PartClock part;
   DArray<int32_t> j;
   DArray<uint8_t> reach;
   LinkInsideBand(lists, &j, &reach);
+  part("split: links inside the band");
   DArray<uint8_t> led_to(nv, 0);
   {
     auto vj = j.DeviceView();
@@ -89,6 +92,7 @@ inline void FindOpenVerticesByWalk(const VertexLists& lists, DArray<uint8_t>* op
       if (vj[v] != static_cast<int32_t>(v)) vl[vj[v]] = 1;
     });
   }
+  part("split: which vertices start a path");
   {
     auto vj = j.DeviceView();
     auto vl = led_to.DeviceView();
@@ -104,6 +108,7 @@ inline void FindOpenVerticesByWalk(const VertexLists& lists, DArray<uint8_t>* op
       }
     });
   }
+  part("split: walk the open paths");
   *open = std::move(reach);
   if (links != nullptr) *links = std::move(j);
 }

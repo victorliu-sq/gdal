@@ -145,6 +145,11 @@ class StripCells {
       data_ = array_.data();
     }
   }
+  // The cells are in device memory already (inflated there): this takes them over.
+  void Take(DArray<T>&& cells) {
+    array_ = std::move(cells);
+    data_ = array_.data();
+  }
   const T* data() const { return data_; }
 
  private:

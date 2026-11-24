@@ -53,6 +53,8 @@ void DeviceMemory::ReturnFreed() {
 #endif
 }
 
+void DeviceMemory::ReleaseAll() {}
+
 // DeviceBytes is in host_memory.cpp, which asks the operating system: what is here is standard C++ only and
 // goes into GDAL as it is.
 

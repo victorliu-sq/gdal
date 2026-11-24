@@ -41,7 +41,9 @@ struct BandPolygons {
 
 class PolygonizerBands {
  public:
-  PolygonizerBands(const PolygonizeConfig& config, const Raster& raster);
+  // device_cells (with band_on_device): the cells of the raster, row after row, in device memory already; they are
+  // taken over and the raster needs no cells on the host.
+  PolygonizerBands(const PolygonizeConfig& config, const Raster& raster, DArray<uint8_t>* device_cells = nullptr);
 
   bool HasStrips() const { return next_row_ < hc_; }
   void FindVerticesOfNextStrip();   // s1 on the next strip; its vertices join the current band

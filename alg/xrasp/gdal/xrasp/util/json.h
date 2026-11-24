@@ -3,6 +3,8 @@
 // The stand-in of GDAL for xrasp/util/json.h of the X-Rasp library (which is nlohmann/json there): the band
 // version keeps the counts of a run in a Json (core/polygonizer_bands.h), and nothing inside GDAL reads them.
 // This file is the fork's own, not a copy: measure/common/targets/scripts/sync_gdal leaves it alone.
+#include <string>
+
 namespace xrasp {
 
 class Json {
@@ -13,6 +15,7 @@ class Json {
   };
   static Json object() { return Json(); }
   Slot operator[](const char*) const { return Slot(); }
+  Slot operator[](const std::string&) const { return Slot(); }
 };
 
 }  // namespace xrasp

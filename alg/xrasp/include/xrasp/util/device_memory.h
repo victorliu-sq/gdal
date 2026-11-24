@@ -32,6 +32,11 @@ class DeviceMemory {
   // Memory that was given back with Deallocate() and that the allocator still holds goes back to the
   // operating system, where the backend can do that (the CPU with glibc); nothing otherwise.
   static void ReturnFreed();
+  // The GPU with a pool: when no array is live, the pool goes back to the GPU as a whole, and the next
+  // Allocate() makes a new one with the configuration of the last Init().  For a caller that shares the GPU
+  // with a library that has a pool of its own: between two calls X-Rasp holds no device memory.  Nothing
+  // when an array is live, or without a pool.
+  static void ReleaseAll();
   // Free and total memory of the GPU as the driver reports them (of the host in the CPU build).
   static void DeviceBytes(size_t* free_bytes, size_t* total_bytes);
 };

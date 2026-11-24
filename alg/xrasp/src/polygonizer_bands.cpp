@@ -19,6 +19,7 @@
 #include "xrasp/steps/s2_links/opt_line_index.h"
 #include "xrasp/util/dev_value.h"
 #include "xrasp/util/device_memory.h"
+#include "xrasp/util/parts.h"
 #include "xrasp/backend/launcher.h"
 
 namespace xrasp {
@@ -443,20 +444,37 @@ void TakeKeptIndex(const DArray<int64_t>& pos, const DArray<int64_t>& ring, int6
   thrust::copy_if(Exec(), renumbered.begin(), renumbered.end(), stays.data(), ring_out->begin(), IsSet{});
 }
 
+// The parts of a ranking (step 3 in two levels): what its profile says, and the rest (the diagonal pairs).
+void AddRankParts(const std::string& where, double total_ms, const RankProfile& prof) {
+  PartsLog& log = PartsLog::get();
+  log.Add(where + ": rank, cuts", prof.cuts_ms);
+  log.Add(where + ": rank, level 1 (walk)", prof.level1_ms);
+  log.Add(where + ": rank, nodes of level 2", prof.nodes_ms);
+  log.Add(where + ": rank, level 2", prof.level2_ms);
+  log.Add(where + ": rank, diagonal pairs", total_ms - prof.cuts_ms - prof.level1_ms - prof.nodes_ms - prof.level2_ms);
+}
+
 int64_t CountHoles(const DArray<uint8_t>& is_hole) {
   return static_cast<int64_t>(thrust::count_if(Exec(), is_hole.begin(), is_hole.end(), IsSet{}));
 }
 
 }  // namespace
 
-PolygonizerBands::PolygonizerBands(const PolygonizeConfig& config, const Raster& raster)
+PolygonizerBands::PolygonizerBands(const PolygonizeConfig& config, const Raster& raster, DArray<uint8_t>* device_cells)
     : config_(config), raster_(raster), h_(raster.h), w_(raster.w), wc_(raster.w + 1), hc_(raster.h + 1) {
   if (h_ < 1 || w_ < 1) throw std::runtime_error("the raster is empty");
   if (config_.labels) throw std::runtime_error("-labels needs -mode whole");
   rows_ = std::max<int64_t>(1, std::min<int64_t>(hc_, static_cast<int64_t>(config_.strip_cells) / std::max<int64_t>(1, w_)));
   counts_ = Json::object();
+  PartsLog::get().parts.clear();
   // band_on_device: the raster is in device memory before anything is timed, a strip is rows of it
-  if (config_.band_on_device) device_cells_.Load(raster_.cells<uint8_t>(), raster_.num_bytes());
+  if (config_.band_on_device) {
+    if (device_cells != nullptr && !device_cells->empty()) {
+      device_cells_.Take(std::move(*device_cells));
+    } else {
+      device_cells_.Load(raster_.cells<uint8_t>(), raster_.num_bytes());
+    }
+  }
 }
 
 // ---- s1 on one strip ----------------------------------------------------------------------------------------
@@ -515,17 +533,21 @@ void PolygonizerBands::SortBand() {
   lists_ = VertexLists();
   lists_.wc = wc_;
   lists_.hc = hc_;
+  PartClock part;
   for (int d : {1, 3}) {
     lists_.pos[d] = Concatenate(&pos_parts_[d]);
     lists_.flag[d] = Concatenate(&flag_parts_[d]);
   }
+  part("sort: strips of a band put together");
   for (int d : {0, 2}) {
     lists_.pos[d] = Concatenate(&pos_parts_[d]);
     flag_parts_[d].clear();
     SortAndUnpackVertical(&lists_.pos[d], &lists_.flag[d]);
   }
+  part("sort: vertical vertices sorted");
   lists_.SetCounts();
   edges_ = Concatenate(&edge_parts_);
+  part("sort: edges put together");
   n_vertices_ += lists_.size();
 }
 
@@ -535,9 +557,12 @@ void PolygonizerBands::SplitBand() {
   DArray<int32_t> links;                        // open_walk: the next vertex of every vertex inside the band
   DeviceSync();
   auto t0 = std::chrono::steady_clock::now();
+  PartClock part;
   if (config_.link_index) BuildLineIndex(&lists_);
+  part("split: index of the lines");
   FindOpenVertices(lists_, &open, config_.open_walk, &links);
   FreeLineIndex(&lists_);
+  part.Reset();                                 // FindOpenVertices names its own parts
   DeviceSync();
   split_open_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   t0 = std::chrono::steady_clock::now();
@@ -564,11 +589,13 @@ void PolygonizerBands::SplitBand() {
   }
   kept.SetCounts();
   lists_ = std::move(kept);
+  part("split: the two kinds of vertices apart");
   DeviceSync();
   split_groups_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   t0 = std::chrono::steady_clock::now();
   band_links_.Free();
   if (!links.empty()) KeptLinks(links, open, number, lists_.size(), &band_links_);    // step 2 of the band is done with this
+  part("split: links of the vertices that stay");
   DeviceSync();
   split_links_ms_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
 }
@@ -577,6 +604,7 @@ void PolygonizerBands::SplitBand() {
 void PolygonizerBands::CloseBandRings() {
   band_has_rings_ = lists_.size() > 0;
   if (!band_has_rings_) return;
+  PartClock part;
   pipe_ = RingPipeline();
   if (static_cast<int64_t>(band_links_.size()) == lists_.size()) {
     pipe_.UseLinks(std::move(band_links_), lists_);
@@ -586,25 +614,33 @@ void PolygonizerBands::CloseBandRings() {
     FreeLineIndex(&lists_);
   }
   band_links_.Free();
+  part("close: corners of the vertices");
   pipe_.Rank(lists_, config_.tile, config_.rank_walk);
+  AddRankParts("close", part.Lap(), pipe_.prof);
   pipe_.Repair(lists_, config_.tile);
+  part("close: diagonal repair");
   pipe_.Classify(lists_);
+  part("close: rings");
   n_one_block_ += pipe_.one_block;
   AttachBandHoles(pipe_.rings, edges_, pos0_all_, owner_, wc_, hc_, ring_base_, &parent_, &pending_);
+  part("close: holes");
 }
 
 // vertices in ring order and the ring tables of pipe_ -> chunk (parent and pending are filled by the caller)
 void PolygonizerBands::RingsToChunk(Chunk* chunk) {
   Rings& rings = pipe_.rings;
+  PartClock part;
   DArray<int32_t> xr, yr;
   VerticesInRingOrder(rings, pipe_.vx, pipe_.vy, &xr, &yr);
   pipe_.vx.Free();
   pipe_.vy.Free();
+  part("finish: vertices in ring order");
   chunk->n_rings = rings.nr;
   if (config_.band_on_device) {
     chunk->dx = std::move(xr);
     chunk->dy = std::move(yr);
     RingValues(raster_.type, device_cells_.data(), w_, rings, &chunk->d_value);
+    part("finish: values of the rings");
     chunk->d_len = std::move(rings.length);
     chunk->d_hole = std::move(rings.is_hole);
     return;
@@ -628,8 +664,10 @@ void PolygonizerBands::BandToHost() {
   if (band_has_rings_) {
     Chunk chunk;
     RingsToChunk(&chunk);
+    PartClock part;
     DArray<int64_t> ring0;
     RingsOfDownEntered(pipe_.rings, lists_.count[0], ring_base_, &ring0);
+    part("finish: rings of the down-entered vertices");
     if (config_.band_on_device) {
       index.d_pos = std::move(lists_.pos[0]);
       index.d_ring = std::move(ring0);
@@ -658,6 +696,7 @@ void PolygonizerBands::BandToHost() {
     if (chunk.n_rings > 0 || chunk.n_all > 0) chunks_.push_back(std::move(chunk));
   }
   band_index_.push_back(std::move(index));
+  PartClock freed;
   pipe_ = RingPipeline();
   lists_.Free();
   edges_.Free();
@@ -665,6 +704,7 @@ void PolygonizerBands::BandToHost() {
   owner_.Free();
   parent_.Free();
   pending_.Free();
+  freed("finish: arrays of the band given back");
   n_bands_++;
   in_band_ = 0;
   band_first_row_ = next_row_;
@@ -789,6 +829,7 @@ void PolygonizerBands::CloseOpenRings() {
   if (n_open_ > static_cast<int64_t>(INT32_MAX)) {
     throw std::runtime_error("more than 2^31 - 1 vertices are on rings that cross bands");
   }
+  PartClock part;
   lists_ = VertexLists();
   lists_.wc = wc_;
   lists_.hc = hc_;
@@ -804,13 +845,18 @@ void PolygonizerBands::CloseOpenRings() {
     Unpack(&lists_.pos[d], &lists_.flag[d]);
   }
   lists_.SetCounts();
+  part("open: lists of the set-aside vertices");
   pipe_ = RingPipeline();
   if (config_.link_index) BuildLineIndex(&lists_);
   pipe_.Link(lists_);
   FreeLineIndex(&lists_);
+  part("open: links");
   pipe_.Rank(lists_, config_.tile, config_.rank_walk);
+  AddRankParts("open", part.Lap(), pipe_.prof);
   pipe_.Repair(lists_, config_.tile);
+  part("open: diagonal repair");
   pipe_.Classify(lists_);
+  part("open: rings");
   n_one_block_ += pipe_.one_block;
   const Rings& rings = pipe_.rings;
   if (config_.band_on_device) {
@@ -837,6 +883,7 @@ void PolygonizerBands::CloseOpenRings() {
         throw std::runtime_error("a hole found no ring of its block to the west");
       }
     }
+    part("open: holes");
     d_open_pos0_ = std::move(lists_.pos[0]);
     d_open_ring0_ = std::move(ring0);
     const int64_t nr_open = rings.nr;
@@ -991,11 +1038,13 @@ void PolygonizerBands::MergeRings() {
   counts_["HoleJumpRounds"] = hops;
   counts_["Polygons"] = npoly;
   counts_["OuterRings"] = nr - nholes;
+  for (const auto& p : PartsLog::get().parts) counts_["Part " + p.first] = p.second;
 }
 
 // band_on_device: the same in device memory.  The vertices stay where the bands left them, one piece per band
 // and one of the rings that cross bands; the tables of the result index them as if they were one array.
 void PolygonizerBands::MergeRingsOnDevice() {
+  PartClock part;
   const int64_t nr = ring_base_;
   for (auto& b : band_index_) {
     b.d_pos.Free();
@@ -1016,20 +1065,25 @@ void PolygonizerBands::MergeRingsOnDevice() {
   DArray<int64_t> parent = Concatenate(&parent_parts);
   DArray<int64_t> pending = Concatenate(&pending_parts);
   DArray<int64_t> value = Concatenate(&value_parts);
+  part("merge: tables of the rings put together");
   bool bad = false;
   const int64_t waiting = AnswerWaitingHoles(pending, d_open_pos0_, d_open_ring0_, hc_, &parent, &bad);
   if (bad) throw std::runtime_error("a waiting hole found no set-aside vertex below it");
   pending.Free();
   d_open_pos0_.Free();
   d_open_ring0_.Free();
+  part("merge: holes that waited");
   const int hops = JumpToOuterRing(&parent);
+  part("merge: every ring to its outer ring");
   const int64_t nholes = CountHoles(is_hole);
   DArray<int64_t> start;
   OrderRingsOnDevice(parent, is_hole, &r_ring_index_, &start);
   parent.Free();
   is_hole.Free();
   const int64_t npoly = static_cast<int64_t>(start.size());
+  part("merge: rings in the order of the polygons");
   ResultTables(length, value, r_ring_index_, start, &r_values_, &r_poly_offsets_, &r_ring_offsets_);
+  part("merge: tables of the result");
   length.Free();
   value.Free();
   start.Free();
@@ -1050,6 +1104,7 @@ void PolygonizerBands::MergeRingsOnDevice() {
   counts_["HoleJumpRounds"] = hops;
   counts_["Polygons"] = npoly;
   counts_["OuterRings"] = nr - nholes;
+  for (const auto& p : PartsLog::get().parts) counts_["Part " + p.first] = p.second;
   counts_["ResultDeviceBytes"] = DeviceMemory::CurrentBytes();    // the raster and the result
   if (sink_) DeviceMemory::ReturnFreed();      // the arrays of the last steps, before the caller writes
   if (sink_) counts_["RingsGivenToSink"] = n_emitted_rings_;       // rings of polygons a sink took band by band
